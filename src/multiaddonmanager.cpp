@@ -46,6 +46,7 @@ CConVar<bool> mm_cache_clients_with_addons("mm_cache_clients_with_addons", FCVAR
 CConVar<float> mm_cache_clients_duration("mm_cache_clients_duration", FCVAR_NONE, "How long to cache clients' downloaded addons list in seconds, pass 0 for forever.", 0.0f);
 CConVar<float> mm_addon_connection_timeout("mm_addon_connection_timeout", FCVAR_NONE, "How long until clients are timed out while downloading the first required addon (usually the current map), 0 disables", 30.f);
 CConVar<float> mm_extra_addons_timeout("mm_extra_addons_timeout", FCVAR_NONE, "How long until clients are timed out in between connects for extra addons in seconds, requires mm_extra_addons to be used", 10.f);
+CConVar<float> mm_steam_refresh_delay("mm_steam_refresh_delay", FCVAR_NONE, "Minimum seconds to wait after Steam API activation before refreshing/downloading addons. Also waits until the gameserver is logged on to Steam.", 5.f);
 
 CConVar<bool> mm_addon_debug("mm_addon_debug", FCVAR_NONE, "Whether to print some extra debug information", false);
 
@@ -682,7 +683,11 @@ void MultiAddonManager::Hook_GameServerSteamAPIActivated()
 
 	m_CallbackDownloadItemResult.Register(this, &MultiAddonManager::OnAddonDownloaded);
 
-	RefreshAddons(true);
+	// GameServerSteamAPIActivated fires before the gameserver finishes logging on to Steam.
+	// Defer RefreshAddons until we are logged on (plus optional delay) to avoid failed DownloadItem calls.
+	m_bPendingSteamRefresh = true;
+	m_flSteamApiActivatedTime = Plat_FloatTime();
+	Message("Deferring addon refresh for at least %.1f seconds until Steam logon completes\n", mm_steam_refresh_delay.Get());
 
 	RETURN_META(MRES_IGNORED);
 }
@@ -1199,6 +1204,20 @@ void MultiAddonManager::Hook_ClientActive(CPlayerSlot slot, bool bLoadGame, cons
 void MultiAddonManager::Hook_GameFrame(bool simulating, bool bFirstTick, bool bLastTick)
 {
 	static double s_flTime = 0.0f;
+
+	if (m_bPendingSteamRefresh)
+	{
+		ISteamGameServer *pGameServer = SteamGameServer();
+		const bool bLoggedOn = pGameServer && pGameServer->BLoggedOn();
+		const bool bDelayElapsed = Plat_FloatTime() - m_flSteamApiActivatedTime >= mm_steam_refresh_delay.Get();
+
+		if (bLoggedOn && bDelayElapsed)
+		{
+			m_bPendingSteamRefresh = false;
+			Message("Steam logon ready, refreshing addons\n");
+			RefreshAddons(true);
+		}
+	}
 
 	// Print download progress every second
 	if (Plat_FloatTime() - s_flTime > 1.f)

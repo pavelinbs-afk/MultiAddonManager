@@ -106,6 +106,10 @@ private:
 	std::string m_sCurrentWorkshopMap;
 
 	std::set<uint64> m_TimedOutClients;
+
+	// Deferred refresh: GameServerSteamAPIActivated runs before Steam logon finishes
+	bool m_bPendingSteamRefresh = false;
+	double m_flSteamApiActivatedTime = 0.0;
 };
 
 extern MultiAddonManager g_MultiAddonManager;
