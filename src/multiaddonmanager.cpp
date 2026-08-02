@@ -247,7 +247,7 @@ CConVar<CUtlString> mm_extra_addons("mm_extra_addons", FCVAR_NONE, "The workshop
 	{
 		StringToVector(new_val->Get(), g_MultiAddonManager.m_ExtraAddons);
 
-		g_MultiAddonManager.RefreshAddons();
+		g_MultiAddonManager.RequestRefreshAddons();
 	});
 
 
@@ -662,6 +662,27 @@ void MultiAddonManager::RefreshAddons(bool bReloadMap)
 		ReloadMap();
 }
 
+void MultiAddonManager::RequestRefreshAddons(bool bReloadMap)
+{
+	const bool bDedicated = g_pEngineServer->IsDedicatedServer();
+	ISteamGameServer *pGameServer = bDedicated ? SteamGameServer() : nullptr;
+	const bool bLoggedOn = !bDedicated || (pGameServer && pGameServer->BLoggedOn());
+	const bool bDelayElapsed = m_flSteamApiActivatedTime <= 0.0
+		|| Plat_FloatTime() - m_flSteamApiActivatedTime >= mm_steam_refresh_delay.Get();
+
+	if (!bLoggedOn || !bDelayElapsed || !GetSteamUGC())
+	{
+		m_bPendingSteamRefresh = true;
+		m_bPendingReloadMap = m_bPendingReloadMap || bReloadMap;
+		if (m_flSteamApiActivatedTime <= 0.0)
+			m_flSteamApiActivatedTime = Plat_FloatTime();
+		Message("Deferring addon refresh until Steam logon is ready\n");
+		return;
+	}
+
+	RefreshAddons(bReloadMap);
+}
+
 void MultiAddonManager::ClearAddons()
 {
 	m_ExtraAddons.RemoveAll();
@@ -684,10 +705,9 @@ void MultiAddonManager::Hook_GameServerSteamAPIActivated()
 	m_CallbackDownloadItemResult.Register(this, &MultiAddonManager::OnAddonDownloaded);
 
 	// GameServerSteamAPIActivated fires before the gameserver finishes logging on to Steam.
-	// Defer RefreshAddons until we are logged on (plus optional delay) to avoid failed DownloadItem calls.
-	m_bPendingSteamRefresh = true;
 	m_flSteamApiActivatedTime = Plat_FloatTime();
-	Message("Deferring addon refresh for at least %.1f seconds until Steam logon completes\n", mm_steam_refresh_delay.Get());
+	m_bPendingReloadMap = true;
+	RequestRefreshAddons(true);
 
 	RETURN_META(MRES_IGNORED);
 }
@@ -1007,7 +1027,7 @@ void MultiAddonManager::Hook_StartupServer(const GameSessionConfiguration_t &con
 	// This has to be done here to replicate the behavior on clients, where they mount addons in the string order
 	// So if the current map is ID 1 and extra addons are IDs 2 and 3, they would be mounted in that order with ID 3 at the top
 	// Note that the actual map VPK(s) and any sub-maps like team_select will be even higher, but those usually don't contain any assets that concern us
-	RefreshAddons();
+	RequestRefreshAddons();
 }
 
 bool FASTCALL Hook_SendNetMessage(CServerSideClientBase *pClient, CNetMessage *pData, NetChannelBufType_t bufType, SendNetMessage_t pOriginalFunc)
@@ -1211,11 +1231,13 @@ void MultiAddonManager::Hook_GameFrame(bool simulating, bool bFirstTick, bool bL
 		const bool bLoggedOn = pGameServer && pGameServer->BLoggedOn();
 		const bool bDelayElapsed = Plat_FloatTime() - m_flSteamApiActivatedTime >= mm_steam_refresh_delay.Get();
 
-		if (bLoggedOn && bDelayElapsed)
+		if (bLoggedOn && bDelayElapsed && GetSteamUGC())
 		{
+			const bool bReloadMap = m_bPendingReloadMap;
 			m_bPendingSteamRefresh = false;
+			m_bPendingReloadMap = false;
 			Message("Steam logon ready, refreshing addons\n");
-			RefreshAddons(true);
+			RefreshAddons(bReloadMap);
 		}
 	}
 

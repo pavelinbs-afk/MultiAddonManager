@@ -65,6 +65,7 @@ public: //hooks
 	bool DownloadAddon(const char *pszAddon, bool bImportant = false, bool bForce = false);
 	void PrintDownloadProgress();
 	void RefreshAddons(bool bReloadMap = false);
+	void RequestRefreshAddons(bool bReloadMap = false);
 	void ClearAddons();
 	void ReloadMap();
 	std::string GetCurrentWorkshopMap() { return m_sCurrentWorkshopMap; }
@@ -107,8 +108,9 @@ private:
 
 	std::set<uint64> m_TimedOutClients;
 
-	// Deferred refresh: GameServerSteamAPIActivated runs before Steam logon finishes
+	// Deferred refresh: GameServerSteamAPIActivated / StartupServer can run before Steam logon finishes
 	bool m_bPendingSteamRefresh = false;
+	bool m_bPendingReloadMap = false;
 	double m_flSteamApiActivatedTime = 0.0;
 };
 
