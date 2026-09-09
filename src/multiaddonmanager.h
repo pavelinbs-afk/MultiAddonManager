@@ -28,6 +28,9 @@
 #include "steam/steam_api_common.h"
 #include "steam/isteamugc.h"
 #include "imultiaddonmanager.h"
+#include <set>
+#include <string>
+#include <unordered_map>
 
 #ifdef _WIN32
 #define ROOTBIN "/bin/win64/"
@@ -57,7 +60,9 @@ public: //hooks
 
 	void ParseCfg();
 	void BuildAddonPath(const char *pszAddon, char *buf, size_t len, bool bLegacy);
-	bool MountAddon(const char *pszAddon, bool bAddToTail);
+	bool ResolveAddonPath(const char *pszAddon, char *buf, size_t len);
+	bool GetAddonInstallMeta(PublishedFileId_t iAddon, uint64 &nSizeOnDisk, uint32 &nTimeStamp);
+	bool MountAddon(const char *pszAddon, bool bAddToTail = false, bool bCheckForUpdates = true);
 	bool UnmountAddon(const char *pszAddon);
 	bool AddAddon(const char *pszAddon, bool bRefresh = false);
 	bool RemoveAddon(const char *pszAddon, bool bRefresh = false);
@@ -66,6 +71,7 @@ public: //hooks
 	void PrintDownloadProgress();
 	void RefreshAddons(bool bReloadMap = false);
 	void RequestRefreshAddons(bool bReloadMap = false);
+	void CheckMountedAddons();
 	void ClearAddons();
 	void ReloadMap();
 	std::string GetCurrentWorkshopMap() { return m_sCurrentWorkshopMap; }
@@ -81,11 +87,12 @@ public: //hooks
 	void AddTimedOutClient(uint64 steamID64) { m_TimedOutClients.insert(steamID64); }
 
 public:
-	const char *GetAuthor() override		{ return "xen"; }
+	const char *GetAuthor() override		{ return "xen & pRfect"; }
 	const char *GetName() override			{ return "MultiAddonManager"; }
 	const char *GetDescription() override	{ return "Multi Addon Manager"; }
 	const char *GetURL() override			{ return "https://github.com/Source2ZE/MultiAddonManager"; }
 	const char *GetLicense() override		{ return "GPL v3 License"; }
+	const char *GetVersion() override		{ return "1.2.2"; }
 	const char *GetVersion() override		{ return MULTIADDONMANAGER_VERSION; }  // defined by the build script
 	const char *GetDate() override			{ return __DATE__; }
 	const char *GetLogTag() override		{ return "MultiAddonManager"; }
@@ -99,8 +106,16 @@ public:
 	CUtlVector<std::string> m_GlobalClientAddons;
 
 private:
+	struct AddonMountMeta_t
+	{
+		std::string path;
+		uint64 sizeOnDisk = 0;
+		uint32 timeStamp = 0;
+	};
+
 	CUtlVector<PublishedFileId_t> m_ImportantDownloads; // Important addon downloads that will trigger a map reload when finished
 	CUtlQueue<PublishedFileId_t> m_DownloadQueue; // Queue of all addon downloads to print progress
+	std::unordered_map<std::string, AddonMountMeta_t> m_AddonMountMeta; // Size/timestamp captured at mount time
 
 	STEAM_GAMESERVER_CALLBACK_MANUAL(MultiAddonManager, OnAddonDownloaded, DownloadItemResult_t, m_CallbackDownloadItemResult);
 	// Used when reloading current map

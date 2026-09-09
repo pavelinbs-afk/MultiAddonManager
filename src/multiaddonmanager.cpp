@@ -484,7 +484,41 @@ void MultiAddonManager::BuildAddonPath(const char *pszAddon, char *buf, size_t l
 	V_snprintf(buf, len, "%ssteamapps/workshop/content/730/%s/%s%s.vpk", s_sWorkingDir.Get(), pszAddon, pszAddon, bLegacy ? "" : "_dir");
 }
 
-bool MultiAddonManager::MountAddon(const char *pszAddon, bool bAddToTail = false)
+bool MultiAddonManager::ResolveAddonPath(const char *pszAddon, char *buf, size_t len)
+{
+	BuildAddonPath(pszAddon, buf, len);
+
+	if (!g_pFullFileSystem->FileExists(buf))
+	{
+		// This might be a legacy addon (before multi-chunk was introduced), try again without the _dir
+		BuildAddonPath(pszAddon, buf, len, true);
+
+		if (!g_pFullFileSystem->FileExists(buf))
+			return false;
+	}
+	else
+	{
+		// We still need it without _dir anyway because the filesystem will append suffixes if needed
+		BuildAddonPath(pszAddon, buf, len, true);
+	}
+
+	return true;
+}
+
+bool MultiAddonManager::GetAddonInstallMeta(PublishedFileId_t iAddon, uint64 &nSizeOnDisk, uint32 &nTimeStamp)
+{
+	nSizeOnDisk = 0;
+	nTimeStamp = 0;
+
+	ISteamUGC *pUGC = GetSteamUGC();
+	if (!pUGC)
+		return false;
+
+	char szFolder[MAX_PATH];
+	return pUGC->GetItemInstallInfo(iAddon, &nSizeOnDisk, szFolder, sizeof(szFolder), &nTimeStamp);
+}
+
+bool MultiAddonManager::MountAddon(const char *pszAddon, bool bAddToTail, bool bCheckForUpdates)
 {
 	if (!pszAddon || !*pszAddon)
 		return false;
@@ -506,48 +540,56 @@ bool MultiAddonManager::MountAddon(const char *pszAddon, bool bAddToTail = false
 		return false;
 	}
 
+	if (bCheckForUpdates && (iAddonState & k_EItemStateNeedsUpdate))
+	{
+		Message("%s: Addon %s has an update available, queuing a download\n", __func__, pszAddon);
+		DownloadAddon(pszAddon, true, true);
+		return false;
+	}
+
 	if (!(iAddonState & k_EItemStateInstalled))
 	{
 		Message("%s: Addon %s is not installed, queuing a download\n", __func__, pszAddon);
 		DownloadAddon(pszAddon, true, true);
 		return false;
 	}
-	else if (mm_addon_mount_download.Get())
+	else if (bCheckForUpdates && mm_addon_mount_download.Get())
 	{
 		// Queue a download anyway in case the addon got an update and the server desires this, but don't reload the map when done
 		DownloadAddon(pszAddon, false, true);
 	}
 
 	char pszPath[MAX_PATH];
-	BuildAddonPath(pszAddon, pszPath, sizeof(pszPath));
-
-	if (!g_pFullFileSystem->FileExists(pszPath))
+	if (!ResolveAddonPath(pszAddon, pszPath, sizeof(pszPath)))
 	{
-		// This might be a legacy addon (before mutli-chunk was introduced), try again without the _dir
-		BuildAddonPath(pszAddon, pszPath, sizeof(pszPath), true);
-
-		if (!g_pFullFileSystem->FileExists(pszPath))
-		{
-			Panic("%s: Addon %s not found at %s\n", __func__, pszAddon, pszPath);
-			return false;
-		}
-	}
-	else
-	{
-		// We still need it without _dir anyway because the filesystem will append suffixes if needed
-		BuildAddonPath(pszAddon, pszPath, sizeof(pszPath), true);
-	}
-
-	if (m_MountedAddons.Find(pszAddon) != -1)
-	{
-		Panic("%s: Addon %s is already mounted\n", __func__, pszAddon);
+		Panic("%s: Addon %s not found at %s\n", __func__, pszAddon, pszPath);
 		return false;
 	}
 
-	Message("Adding search path: %s\n", pszPath);
+	uint64 nSizeOnDisk = 0;
+	uint32 nTimeStamp = 0;
+	GetAddonInstallMeta(iAddon, nSizeOnDisk, nTimeStamp);
+
+	if (m_MountedAddons.Find(pszAddon) != -1)
+	{
+		auto it = m_AddonMountMeta.find(pszAddon);
+		const bool bHasMeta = it != m_AddonMountMeta.end();
+		const bool bPathExists = g_pFullFileSystem->FileExists(pszPath);
+		const bool bMetaChanged = bHasMeta && (it->second.sizeOnDisk != nSizeOnDisk || it->second.timeStamp != nTimeStamp);
+
+		if (bPathExists && bHasMeta && !bMetaChanged)
+			return true;
+
+		Message("%s: Addon %s is mounted but %s, remounting\n", __func__, pszAddon,
+			!bPathExists ? "files are missing" : "size/timestamp changed");
+		UnmountAddon(pszAddon);
+	}
+
+	Message("Adding search path: %s (size=%llu, timestamp=%u)\n", pszPath, (unsigned long long)nSizeOnDisk, nTimeStamp);
 
 	g_pFullFileSystem->AddSearchPath(pszPath, "GAME", bAddToTail ? PATH_ADD_TO_TAIL : PATH_ADD_TO_HEAD, SEARCH_PATH_PRIORITY_VPK);
 	m_MountedAddons.AddToTail(pszAddon);
+	m_AddonMountMeta[pszAddon] = { pszPath, nSizeOnDisk, nTimeStamp };
 
 	return true;
 }
@@ -558,14 +600,35 @@ bool MultiAddonManager::UnmountAddon(const char *pszAddon)
 		return false;
 
 	char path[MAX_PATH];
-	BuildAddonPath(pszAddon, path, sizeof(path));
+	bool bRemoved = false;
 
-	if (!g_pFullFileSystem->RemoveSearchPath(path, "GAME"))
-		return false;
+	// Prefer the path we actually mounted (non-_dir / legacy style)
+	auto it = m_AddonMountMeta.find(pszAddon);
+	if (it != m_AddonMountMeta.end() && !it->second.path.empty())
+	{
+		V_strncpy(path, it->second.path.c_str(), sizeof(path));
+		bRemoved = g_pFullFileSystem->RemoveSearchPath(path, "GAME");
+	}
+
+	if (!bRemoved)
+	{
+		BuildAddonPath(pszAddon, path, sizeof(path), true);
+		bRemoved = g_pFullFileSystem->RemoveSearchPath(path, "GAME");
+	}
+
+	if (!bRemoved)
+	{
+		BuildAddonPath(pszAddon, path, sizeof(path), false);
+		bRemoved = g_pFullFileSystem->RemoveSearchPath(path, "GAME");
+	}
 
 	m_MountedAddons.FindAndFastRemove(pszAddon);
+	m_AddonMountMeta.erase(pszAddon);
 
-	Message("Removing search path: %s\n", path);
+	if (bRemoved)
+		Message("Removing search path: %s\n", path);
+	else
+		Message("Addon %s untracked (search path already gone)\n", pszAddon);
 
 	return true;
 }
@@ -611,13 +674,14 @@ bool MultiAddonManager::DownloadAddon(const char *pszAddon, bool bImportant, boo
 
 	if (m_DownloadQueue.Check(addon))
 	{
-		Panic("%s: Addon %s is already queued for download!\n", __func__, pszAddon);
+		if (mm_addon_debug.Get())
+			Message("%s: Addon %s is already queued for download\n", __func__, pszAddon);
 		return false;
 	}
 
 	uint32 nItemState = GetSteamUGC()->GetItemState(addon);
 
-	if (!bForce && (nItemState & k_EItemStateInstalled))
+	if (!bForce && (nItemState & k_EItemStateInstalled) && !(nItemState & k_EItemStateNeedsUpdate))
 	{
 		Message("Addon %lli is already installed\n", addon);
 		return true;
@@ -647,8 +711,8 @@ void MultiAddonManager::RefreshAddons(bool bReloadMap)
 	Message("Refreshing addons (%s)\n", VectorToString(m_ExtraAddons).c_str());
 
 	// Remove our paths first in case addons were switched
-	FOR_EACH_VEC_BACK(m_MountedAddons, i)
-		UnmountAddon(m_MountedAddons[i].c_str());
+	while (m_MountedAddons.Count() > 0)
+		UnmountAddon(m_MountedAddons.Tail().c_str());
 
 	bool bAllAddonsMounted = true;
 
@@ -683,6 +747,92 @@ void MultiAddonManager::RequestRefreshAddons(bool bReloadMap)
 	RefreshAddons(bReloadMap);
 }
 
+void MultiAddonManager::CheckMountedAddons()
+{
+	if (!GetSteamUGC() || m_ExtraAddons.Count() == 0)
+		return;
+
+	FOR_EACH_VEC(m_ExtraAddons, i)
+	{
+		const char *pszAddon = m_ExtraAddons[i].c_str();
+		PublishedFileId_t iAddon = V_StringToUint64(pszAddon, 0);
+		if (!iAddon)
+			continue;
+
+		uint32 iAddonState = GetSteamUGC()->GetItemState(iAddon);
+
+		if (iAddonState & k_EItemStateLegacyItem)
+			continue;
+
+		if (iAddonState & (k_EItemStateDownloading | k_EItemStateDownloadPending))
+			continue;
+
+		if (m_DownloadQueue.Check(iAddon))
+			continue;
+
+		if (iAddonState & k_EItemStateNeedsUpdate)
+		{
+			Message("Addon %s needs an update, queuing a download\n", pszAddon);
+			if (m_MountedAddons.Find(pszAddon) != -1)
+				UnmountAddon(pszAddon);
+			DownloadAddon(pszAddon, true, true);
+			continue;
+		}
+
+		if (!(iAddonState & k_EItemStateInstalled))
+		{
+			if (m_MountedAddons.Find(pszAddon) != -1)
+			{
+				Message("Addon %s was mounted but is no longer installed, remounting\n", pszAddon);
+				UnmountAddon(pszAddon);
+			}
+			MountAddon(pszAddon);
+			continue;
+		}
+
+		char pszPath[MAX_PATH];
+		const bool bPathResolved = ResolveAddonPath(pszAddon, pszPath, sizeof(pszPath));
+		const bool bMounted = m_MountedAddons.Find(pszAddon) != -1;
+
+		if (!bMounted)
+		{
+			Message("Addon %s is listed but not mounted, mounting\n", pszAddon);
+			MountAddon(pszAddon);
+			continue;
+		}
+
+		if (!bPathResolved || !g_pFullFileSystem->FileExists(pszPath))
+		{
+			Message("Addon %s was mounted but files are missing, remounting\n", pszAddon);
+			UnmountAddon(pszAddon);
+			MountAddon(pszAddon);
+			continue;
+		}
+
+		uint64 nSizeOnDisk = 0;
+		uint32 nTimeStamp = 0;
+		if (!GetAddonInstallMeta(iAddon, nSizeOnDisk, nTimeStamp))
+			continue;
+
+		auto it = m_AddonMountMeta.find(pszAddon);
+		if (it == m_AddonMountMeta.end())
+		{
+			m_AddonMountMeta[pszAddon] = { pszPath, nSizeOnDisk, nTimeStamp };
+			continue;
+		}
+
+		if (it->second.sizeOnDisk != nSizeOnDisk || it->second.timeStamp != nTimeStamp)
+		{
+			Message("Addon %s size/timestamp changed (size %llu->%llu, time %u->%u), remounting\n",
+				pszAddon,
+				(unsigned long long)it->second.sizeOnDisk, (unsigned long long)nSizeOnDisk,
+				it->second.timeStamp, nTimeStamp);
+			UnmountAddon(pszAddon);
+			MountAddon(pszAddon);
+		}
+	}
+}
+
 void MultiAddonManager::ClearAddons()
 {
 	m_ExtraAddons.RemoveAll();
@@ -690,8 +840,8 @@ void MultiAddonManager::ClearAddons()
 	// Update the convar to reflect the new addon list, but don't trigger the callback
 	mm_extra_addons.GetConVarData()->Value(0)->m_StringValue = "";
 	
-	FOR_EACH_VEC_BACK(m_MountedAddons, i)
-		UnmountAddon(m_MountedAddons[i].c_str());
+	while (m_MountedAddons.Count() > 0)
+		UnmountAddon(m_MountedAddons.Tail().c_str());
 }
 
 void MultiAddonManager::Hook_GameServerSteamAPIActivated()
@@ -739,9 +889,27 @@ void MultiAddonManager::OnAddonDownloaded(DownloadItemResult_t *pResult)
 		return;
 
 	m_DownloadQueue.RemoveAtHead();
-	
+
 	bool bFound = m_ImportantDownloads.FindAndRemove(pResult->m_nPublishedFileId);
-	
+
+	// Remount updated/downloaded addons that belong to our extra list
+	if (pResult->m_eResult == k_EResultOK)
+	{
+		FOR_EACH_VEC(m_ExtraAddons, i)
+		{
+			if (V_StringToUint64(m_ExtraAddons[i].c_str(), 0) != pResult->m_nPublishedFileId)
+				continue;
+
+			const char *pszAddon = m_ExtraAddons[i].c_str();
+			if (m_MountedAddons.Find(pszAddon) != -1)
+				UnmountAddon(pszAddon);
+
+			if (!MountAddon(pszAddon, false, false))
+				Message("Failed to mount addon %s after download\n", pszAddon);
+			break;
+		}
+	}
+
 	// That was the last important download, now reload the map
 	if (bFound && m_ImportantDownloads.Count() == 0)
 	{
@@ -1241,11 +1409,12 @@ void MultiAddonManager::Hook_GameFrame(bool simulating, bool bFirstTick, bool bL
 		}
 	}
 
-	// Print download progress every second
+	// Print download progress and verify mounted addons every second
 	if (Plat_FloatTime() - s_flTime > 1.f)
 	{
 		s_flTime = Plat_FloatTime();
 		PrintDownloadProgress();
+		CheckMountedAddons();
 	}
 
 	if (!m_TimedOutClients.size())
