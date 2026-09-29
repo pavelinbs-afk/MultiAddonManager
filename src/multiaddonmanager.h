@@ -21,7 +21,9 @@
 
 #include <ISmmPlugin.h>
 #include <igameevents.h>
-#include <sh_vector.h>
+#include <eiface.h>
+#include <iserver.h>
+#include <engine/igameeventsystem.h>
 #include "utlqueue.h"
 #include "utlvector.h"
 #include "networksystem/inetworkserializer.h"
@@ -43,25 +45,27 @@
 class MultiAddonManager : public ISmmPlugin, public IMetamodListener, public IMultiAddonManager
 {
 public:
+	MultiAddonManager();
+
 	bool Load(PluginId id, ISmmAPI *ismm, char *error, size_t maxlen, bool late);
 	bool Unload(char *error, size_t maxlen);
 	void *OnMetamodQuery(const char *iface, int *ret);
-public: //hooks
-	void Hook_GameServerSteamAPIActivated();
-	void Hook_StartupServer(const GameSessionConfiguration_t &config, ISource2WorldSession *, const char *);
-	bool Hook_ClientConnect(CPlayerSlot slot, const char *pszName, uint64 steamID64, const char *pszNetworkID, bool unk1, CBufferString *pRejectReason);
-	void Hook_ClientDisconnect(CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID);
-	void Hook_ClientActive(CPlayerSlot slot, bool bLoadGame, const char *pszName, uint64 steamID64);
-	void Hook_GameFrame(bool simulating, bool bFirstTick, bool bLastTick);
-	void Hook_PostEvent(CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCount, const uint64 *clients,
+public: //hooks (first arg = hooked this; KHook MM 2.0)
+	KHook::Return<void> Hook_GameServerSteamAPIActivated(ISource2Server*);
+	KHook::Return<void> Hook_StartupServer(INetworkServerService*, const GameSessionConfiguration_t &config, ISource2WorldSession *, const char *);
+	KHook::Return<bool> Hook_ClientConnect(IServerGameClients*, CPlayerSlot slot, const char *pszName, uint64 steamID64, const char *pszNetworkID, bool unk1, CBufferString *pRejectReason);
+	KHook::Return<void> Hook_ClientDisconnect(IServerGameClients*, CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID);
+	KHook::Return<void> Hook_ClientActive(IServerGameClients*, CPlayerSlot slot, bool bLoadGame, const char *pszName, uint64 steamID64);
+	KHook::Return<void> Hook_GameFrame(ISource2Server*, bool simulating, bool bFirstTick, bool bLastTick);
+	KHook::Return<void> Hook_PostEvent(IGameEventSystem*, CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCount, const uint64 *clients,
 		INetworkMessageInternal *pEvent, const CNetMessage *pData, unsigned long nSize, NetChannelBufType_t bufType);
-	int Hook_LoadEventsFromFile(const char *filename, bool bSearchAll);
-	bool Hook_CanHLTVClientConnect(int index, const CSteamID &steamID, int *pRejectReason);
+	KHook::Return<int> Hook_LoadEventsFromFile(IGameEventManager2* pThis, const char *filename, bool bSearchAll);
+	KHook::Return<bool> Hook_CanHLTVClientConnect(IServerGameClients*, int index, const CSteamID &steamID, int *pRejectReason);
 
 	void ParseCfg();
 	void BuildAddonPath(const char *pszAddon, char *buf, size_t len, bool bLegacy);
 	bool ResolveAddonPath(const char *pszAddon, char *buf, size_t len);
-	bool GetAddonInstallMeta(PublishedFileId_t iAddon, uint64 &nSizeOnDisk, uint32 &nTimeStamp);
+	bool GetAddonInstallMeta(PublishedFileId_t iAddon, uint64 &nSizeOnDisk, uint32 &nTimeStamp, char *pszFolder = nullptr, size_t nFolderLen = 0);
 	bool MountAddon(const char *pszAddon, bool bAddToTail = false, bool bCheckForUpdates = true);
 	bool UnmountAddon(const char *pszAddon);
 	bool AddAddon(const char *pszAddon, bool bRefresh = false);
@@ -72,6 +76,7 @@ public: //hooks
 	void RefreshAddons(bool bReloadMap = false);
 	void RequestRefreshAddons(bool bReloadMap = false);
 	void CheckMountedAddons();
+	bool IsSteamReadyForAddons();
 	void ClearAddons();
 	void ReloadMap();
 	std::string GetCurrentWorkshopMap() { return m_sCurrentWorkshopMap; }
@@ -92,8 +97,7 @@ public:
 	const char *GetDescription() override	{ return "Multi Addon Manager"; }
 	const char *GetURL() override			{ return "https://github.com/Source2ZE/MultiAddonManager"; }
 	const char *GetLicense() override		{ return "GPL v3 License"; }
-	const char *GetVersion() override		{ return "1.2.2"; }
-	const char *GetVersion() override		{ return MULTIADDONMANAGER_VERSION; }  // defined by the build script
+	const char *GetVersion() override		{ return "1.2.3.0"; }
 	const char *GetDate() override			{ return __DATE__; }
 	const char *GetLogTag() override		{ return "MultiAddonManager"; }
 
@@ -116,6 +120,7 @@ private:
 	CUtlVector<PublishedFileId_t> m_ImportantDownloads; // Important addon downloads that will trigger a map reload when finished
 	CUtlQueue<PublishedFileId_t> m_DownloadQueue; // Queue of all addon downloads to print progress
 	std::unordered_map<std::string, AddonMountMeta_t> m_AddonMountMeta; // Size/timestamp captured at mount time
+	std::unordered_map<std::string, double> m_AddonNextMountAttempt; // Backoff for failed mount retries
 
 	STEAM_GAMESERVER_CALLBACK_MANUAL(MultiAddonManager, OnAddonDownloaded, DownloadItemResult_t, m_CallbackDownloadItemResult);
 	// Used when reloading current map
@@ -127,6 +132,17 @@ private:
 	bool m_bPendingSteamRefresh = false;
 	bool m_bPendingReloadMap = false;
 	double m_flSteamApiActivatedTime = 0.0;
+
+	KHook::Virtual<ISource2Server, void> m_GameServerSteamAPIActivated;
+	KHook::Virtual<INetworkServerService, void, const GameSessionConfiguration_t&, ISource2WorldSession*, const char*> m_StartupServer;
+	KHook::Virtual<IServerGameClients, bool, CPlayerSlot, const char*, uint64, const char*, bool, CBufferString*> m_ClientConnect;
+	KHook::Virtual<IServerGameClients, void, CPlayerSlot, ENetworkDisconnectionReason, const char*, uint64, const char*> m_ClientDisconnect;
+	KHook::Virtual<IServerGameClients, void, CPlayerSlot, bool, const char*, uint64> m_ClientActive;
+	KHook::Virtual<ISource2Server, void, bool, bool, bool> m_GameFrame;
+	KHook::Virtual<IGameEventSystem, void, CSplitScreenSlot, bool, int, const uint64*,
+		INetworkMessageInternal*, const CNetMessage*, unsigned long, NetChannelBufType_t> m_PostEvent;
+	KHook::Virtual<IGameEventManager2, int, const char*, bool> m_LoadEventsFromFile;
+	KHook::Virtual<IServerGameClients, bool, int, const CSteamID&, int*> m_CanHLTVClientConnect;
 };
 
 extern MultiAddonManager g_MultiAddonManager;

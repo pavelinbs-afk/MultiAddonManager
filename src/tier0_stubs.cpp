@@ -3,4 +3,6 @@
  * memoverride and related headers still reference. Provide local stubs so the
  * plugin can be loaded (dlopen) on current dedicated servers.
  */
-extern "C" bool g_bUpdateStringTokenDatabase = false;
+extern "C" {
+bool g_bUpdateStringTokenDatabase = false;
+}

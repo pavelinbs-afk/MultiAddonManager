@@ -146,7 +146,7 @@ target_include_directories(mam_flags INTERFACE
   "${CMAKE_CURRENT_SOURCE_DIR}/public"
   "${CMAKE_CURRENT_SOURCE_DIR}/vendor/funchook/include"
   "${MMS_CORE}"
-  "${MMS_CORE}/sourcehook"
+  "${MMS_PATH}/third_party/khook/include"
   "${HL2SDK_PATH}/thirdparty/protobuf-3.21.8/src"
   "${HL2SDK_PATH}/public"
   "${HL2SDK_PATH}/public/engine"

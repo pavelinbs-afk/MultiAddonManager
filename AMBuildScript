@@ -155,6 +155,8 @@ class MMSPluginConfig(object):
         '-Wno-uninitialized',
         '-Wno-unused',
         '-Wno-switch',
+        '-Wno-sign-compare',
+        '-Wno-attributes',
         '-msse',
         '-fPIC',
       ]
@@ -280,7 +282,7 @@ class MMSPluginConfig(object):
     cxx.cxxincludes += [
       os.path.join(context.currentSourcePath),
       os.path.join(mms_core_path),	
-      os.path.join(mms_core_path, 'sourcehook'),
+      os.path.join(self.mms_root, 'third_party', 'khook', 'include'),
     ]
 
     defines = []

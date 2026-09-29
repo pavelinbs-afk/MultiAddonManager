@@ -139,19 +139,41 @@ funchook_t *g_pReplyConnectionHook = nullptr;
 funchook_t *g_pScriptGetAddonHook = nullptr;
 
 int g_iLoadEventsFromFileHookId = -1;
+static void* g_pEventMgrVtbl = nullptr;
 
 class GameSessionConfiguration_t { };
 
-SH_DECL_HOOK0_void(IServerGameDLL, GameServerSteamAPIActivated, SH_NOATTRIB, 0);
-SH_DECL_HOOK3_void(INetworkServerService, StartupServer, SH_NOATTRIB, 0, const GameSessionConfiguration_t &, ISource2WorldSession *, const char *);
-SH_DECL_HOOK6(IServerGameClients, ClientConnect, SH_NOATTRIB, 0, bool, CPlayerSlot, const char*, uint64, const char *, bool, CBufferString *);
-SH_DECL_HOOK5_void(IServerGameClients, ClientDisconnect, SH_NOATTRIB, false, CPlayerSlot, ENetworkDisconnectionReason, const char *, uint64, const char *);
-SH_DECL_HOOK4_void(IServerGameClients, ClientActive, SH_NOATTRIB, false, CPlayerSlot, bool, const char *, uint64);
-SH_DECL_HOOK3_void(IServerGameDLL, GameFrame, SH_NOATTRIB, 0, bool, bool, bool);
-SH_DECL_HOOK8_void(IGameEventSystem, PostEventAbstract, SH_NOATTRIB, 0, CSplitScreenSlot, bool, int, const uint64 *,
+using PostEventClientsFn = void (IGameEventSystem::*)(CSplitScreenSlot, bool, int, const uint64 *,
 	INetworkMessageInternal *, const CNetMessage *, unsigned long, NetChannelBufType_t);
-SH_DECL_HOOK2(IGameEventManager2, LoadEventsFromFile, SH_NOATTRIB, 0, int, const char *, bool);
-SH_DECL_HOOK3(IServerGameClients, CanHLTVClientConnect, SH_NOATTRIB, 0, bool, int, const CSteamID &, int *);
+
+template <typename CLASS, typename RETURN, typename... ARGS>
+static void AddGlobalByVtbl(KHook::Virtual<CLASS, RETURN, ARGS...>& hook, void* vtbl)
+{
+	struct { void* v; } fake{ vtbl };
+	hook.AddGlobal(reinterpret_cast<CLASS*>(&fake));
+}
+
+template <typename CLASS, typename RETURN, typename... ARGS>
+static void RemoveGlobalByVtbl(KHook::Virtual<CLASS, RETURN, ARGS...>& hook, void* vtbl)
+{
+	if (!vtbl)
+		return;
+	struct { void* v; } fake{ vtbl };
+	hook.RemoveGlobal(reinterpret_cast<CLASS*>(&fake));
+}
+
+MultiAddonManager::MultiAddonManager() :
+	m_GameServerSteamAPIActivated(&ISource2Server::GameServerSteamAPIActivated, this, &MultiAddonManager::Hook_GameServerSteamAPIActivated, nullptr),
+	m_StartupServer(&INetworkServerService::StartupServer, this, nullptr, &MultiAddonManager::Hook_StartupServer),
+	m_ClientConnect(&IServerGameClients::ClientConnect, this, &MultiAddonManager::Hook_ClientConnect, nullptr),
+	m_ClientDisconnect(&IServerGameClients::ClientDisconnect, this, nullptr, &MultiAddonManager::Hook_ClientDisconnect),
+	m_ClientActive(&IServerGameClients::ClientActive, this, nullptr, &MultiAddonManager::Hook_ClientActive),
+	m_GameFrame(&ISource2Server::GameFrame, this, nullptr, &MultiAddonManager::Hook_GameFrame),
+	m_PostEvent(static_cast<PostEventClientsFn>(&IGameEventSystem::PostEventAbstract), this, &MultiAddonManager::Hook_PostEvent, nullptr),
+	m_LoadEventsFromFile(&IGameEventManager2::LoadEventsFromFile, this, &MultiAddonManager::Hook_LoadEventsFromFile, nullptr),
+	m_CanHLTVClientConnect(&IServerGameClients::CanHLTVClientConnect, this, &MultiAddonManager::Hook_CanHLTVClientConnect, nullptr)
+{
+}
 
 // Signatures
 
@@ -302,7 +324,7 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 	funchook_prepare(g_pSetPendingHostStateRequest, (void**)&g_pfnSetPendingHostStateRequest, (void*)Hook_SetPendingHostStateRequest);
 	funchook_install(g_pSetPendingHostStateRequest, 0);
 
-	// We're using funchook even though it's a virtual function because it can be called on a different thread and SourceHook isn't thread-safe
+	// We're using funchook even though it's a virtual function because it can be called on a different thread and KHook isn't thread-safe
 	void **pServerSideClientVTable = (void **)engineModule.FindVirtualTable("CServerSideClient");
 	g_pfnSendNetMessage_ServerSideClient = (SendNetMessage_t)pServerSideClientVTable[g_iSendNetMessageOffset];
 
@@ -351,21 +373,22 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 	funchook_prepare(g_pScriptGetAddonHook, (void**)&g_pfnScriptGetAddon, (void*)Hook_ScriptGetAddon);
 	funchook_install(g_pScriptGetAddonHook, 0);
 	
-	SH_ADD_HOOK(IServerGameDLL, GameServerSteamAPIActivated, g_pSource2Server, SH_MEMBER(this, &MultiAddonManager::Hook_GameServerSteamAPIActivated), false);
-	SH_ADD_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &MultiAddonManager::Hook_StartupServer), true);
-	SH_ADD_HOOK(IServerGameClients, ClientConnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientConnect), false);
-	SH_ADD_HOOK(IServerGameClients, ClientDisconnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientDisconnect), true);
-	SH_ADD_HOOK(IServerGameClients, ClientActive, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientActive), true);
-	SH_ADD_HOOK(IServerGameClients, CanHLTVClientConnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_CanHLTVClientConnect), false);
-	SH_ADD_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &MultiAddonManager::Hook_GameFrame), true);
-	SH_ADD_HOOK(IGameEventSystem, PostEventAbstract, g_pGameEventSystem, SH_MEMBER(this, &MultiAddonManager::Hook_PostEvent), false);
+	m_GameServerSteamAPIActivated.Add(g_pSource2Server);
+	m_StartupServer.Add(g_pNetworkServerService);
+	m_ClientConnect.Add(g_pSource2GameClients);
+	m_ClientDisconnect.Add(g_pSource2GameClients);
+	m_ClientActive.Add(g_pSource2GameClients);
+	m_CanHLTVClientConnect.Add(g_pSource2GameClients);
+	m_GameFrame.Add(g_pSource2Server);
+	m_PostEvent.Add(g_pGameEventSystem);
 
-	auto pCGameEventManagerVTable = (IGameEventManager2*)serverModule.FindVirtualTable("CGameEventManager");
+	g_pEventMgrVtbl = serverModule.FindVirtualTable("CGameEventManager");
 
-	if (!pCGameEventManagerVTable)
+	if (!g_pEventMgrVtbl)
 		return false;
 
-	g_iLoadEventsFromFileHookId = SH_ADD_DVPHOOK(IGameEventManager2, LoadEventsFromFile, pCGameEventManagerVTable, SH_MEMBER(this, &MultiAddonManager::Hook_LoadEventsFromFile), false);
+	AddGlobalByVtbl(m_LoadEventsFromFile, g_pEventMgrVtbl);
+	g_iLoadEventsFromFileHookId = 1; // non-zero = hooked (compat with old id check)
 
 	if (late)
 	{
@@ -390,15 +413,17 @@ bool MultiAddonManager::Unload(char *error, size_t maxlen)
 {
 	ClearAddons();
 
-	SH_REMOVE_HOOK(IServerGameDLL, GameServerSteamAPIActivated, g_pSource2Server, SH_MEMBER(this, &MultiAddonManager::Hook_GameServerSteamAPIActivated), false);
-	SH_REMOVE_HOOK(INetworkServerService, StartupServer, g_pNetworkServerService, SH_MEMBER(this, &MultiAddonManager::Hook_StartupServer), true);
-	SH_REMOVE_HOOK(IServerGameClients, ClientConnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientConnect), false);
-	SH_REMOVE_HOOK(IServerGameClients, ClientDisconnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientDisconnect), true);
-	SH_REMOVE_HOOK(IServerGameClients, ClientActive, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_ClientActive), true);
-	SH_REMOVE_HOOK(IServerGameClients, CanHLTVClientConnect, g_pSource2GameClients, SH_MEMBER(this, &MultiAddonManager::Hook_CanHLTVClientConnect), false);
-	SH_REMOVE_HOOK(IServerGameDLL, GameFrame, g_pSource2Server, SH_MEMBER(this, &MultiAddonManager::Hook_GameFrame), true);
-	SH_REMOVE_HOOK(IGameEventSystem, PostEventAbstract, g_pGameEventSystem, SH_MEMBER(this, &MultiAddonManager::Hook_PostEvent), false);
-	SH_REMOVE_HOOK_ID(g_iLoadEventsFromFileHookId);
+	m_GameServerSteamAPIActivated.Remove(g_pSource2Server);
+	m_StartupServer.Remove(g_pNetworkServerService);
+	m_ClientConnect.Remove(g_pSource2GameClients);
+	m_ClientDisconnect.Remove(g_pSource2GameClients);
+	m_ClientActive.Remove(g_pSource2GameClients);
+	m_CanHLTVClientConnect.Remove(g_pSource2GameClients);
+	m_GameFrame.Remove(g_pSource2Server);
+	m_PostEvent.Remove(g_pGameEventSystem);
+	RemoveGlobalByVtbl(m_LoadEventsFromFile, g_pEventMgrVtbl);
+	g_pEventMgrVtbl = nullptr;
+	g_iLoadEventsFromFileHookId = -1;
 
 	if (g_pSetPendingHostStateRequest)
 	{
@@ -484,38 +509,168 @@ void MultiAddonManager::BuildAddonPath(const char *pszAddon, char *buf, size_t l
 	V_snprintf(buf, len, "%ssteamapps/workshop/content/730/%s/%s%s.vpk", s_sWorkingDir.Get(), pszAddon, pszAddon, bLegacy ? "" : "_dir");
 }
 
-bool MultiAddonManager::ResolveAddonPath(const char *pszAddon, char *buf, size_t len)
+static void NormalizeDirPath(char *pszPath)
 {
-	BuildAddonPath(pszAddon, buf, len);
+	if (!pszPath || !*pszPath)
+		return;
 
-	if (!g_pFullFileSystem->FileExists(buf))
+	size_t nLen = V_strlen(pszPath);
+	while (nLen > 1 && (pszPath[nLen - 1] == '/' || pszPath[nLen - 1] == '\\'))
 	{
-		// This might be a legacy addon (before multi-chunk was introduced), try again without the _dir
-		BuildAddonPath(pszAddon, buf, len, true);
-
-		if (!g_pFullFileSystem->FileExists(buf))
-			return false;
+		pszPath[nLen - 1] = '\0';
+		--nLen;
 	}
-	else
-	{
-		// We still need it without _dir anyway because the filesystem will append suffixes if needed
-		BuildAddonPath(pszAddon, buf, len, true);
-	}
-
-	return true;
 }
 
-bool MultiAddonManager::GetAddonInstallMeta(PublishedFileId_t iAddon, uint64 &nSizeOnDisk, uint32 &nTimeStamp)
+static bool FileExistsAny(const char *pszPath)
+{
+	if (!pszPath || !*pszPath)
+		return false;
+
+	if (g_pFullFileSystem->FileExists(pszPath))
+		return true;
+
+	return g_pFullFileSystem->FileExists(pszPath, "GAME");
+}
+
+// AddSearchPath uses the non-_dir stem; multi-chunk workshop addons only have *_dir.vpk on disk.
+static bool AddonSearchPathExists(const char *pszPath)
+{
+	if (FileExistsAny(pszPath))
+		return true;
+
+	if (!pszPath || !*pszPath)
+		return false;
+
+	const char *pszExt = V_stristr(pszPath, ".vpk");
+	if (!pszExt)
+		return false;
+
+	char szDirVpk[MAX_PATH];
+	const size_t nStemLen = static_cast<size_t>(pszExt - pszPath);
+	if (nStemLen + 8 >= sizeof(szDirVpk)) // "_dir.vpk"
+		return false;
+
+	V_strncpy(szDirVpk, pszPath, nStemLen + 1);
+	V_strcat(szDirVpk, "_dir.vpk", sizeof(szDirVpk));
+	return FileExistsAny(szDirVpk);
+}
+
+static bool TryAddonVpkInDir(const char *pszDir, const char *pszAddon, char *buf, size_t len)
+{
+	if (!pszDir || !*pszDir || !pszAddon || !*pszAddon)
+		return false;
+
+	char szDir[MAX_PATH];
+	V_strncpy(szDir, pszDir, sizeof(szDir));
+	NormalizeDirPath(szDir);
+
+	char szDirVpk[MAX_PATH];
+	char szPlainVpk[MAX_PATH];
+	V_snprintf(szDirVpk, sizeof(szDirVpk), "%s/%s_dir.vpk", szDir, pszAddon);
+	V_snprintf(szPlainVpk, sizeof(szPlainVpk), "%s/%s.vpk", szDir, pszAddon);
+
+	if (FileExistsAny(szDirVpk))
+	{
+		// Filesystem appends suffixes; AddSearchPath expects the non-_dir stem
+		V_snprintf(buf, len, "%s/%s.vpk", szDir, pszAddon);
+		return true;
+	}
+
+	if (FileExistsAny(szPlainVpk))
+	{
+		V_strncpy(buf, szPlainVpk, len);
+		return true;
+	}
+
+	return false;
+}
+
+bool MultiAddonManager::ResolveAddonPath(const char *pszAddon, char *buf, size_t len)
+{
+	if (!pszAddon || !*pszAddon || !buf || len == 0)
+		return false;
+
+	buf[0] = '\0';
+
+	PublishedFileId_t iAddon = V_StringToUint64(pszAddon, 0);
+	char szInstallFolder[MAX_PATH] = {};
+	uint64 nSizeOnDisk = 0;
+	uint32 nTimeStamp = 0;
+	if (iAddon && GetAddonInstallMeta(iAddon, nSizeOnDisk, nTimeStamp, szInstallFolder, sizeof(szInstallFolder)))
+	{
+		if (TryAddonVpkInDir(szInstallFolder, pszAddon, buf, len))
+			return true;
+	}
+
+	static CBufferStringGrowable<MAX_PATH> s_sExecutablePath;
+	ExecuteOnce(g_pFullFileSystem->GetSearchPath("EXECUTABLE_PATH", GET_SEARCH_PATH_ALL, s_sExecutablePath, 1));
+
+	char szBase[MAX_PATH];
+	V_strncpy(szBase, s_sExecutablePath.Get(), sizeof(szBase));
+	NormalizeDirPath(szBase);
+
+	// Walk parents of EXECUTABLE_PATH: bin/linuxsteamrt64 -> game -> repo root, etc.
+	for (int iDepth = 0; iDepth < 6 && szBase[0]; ++iDepth)
+	{
+		char szWorkshopDir[MAX_PATH];
+		V_snprintf(szWorkshopDir, sizeof(szWorkshopDir), "%s/steamapps/workshop/content/730/%s", szBase, pszAddon);
+		if (TryAddonVpkInDir(szWorkshopDir, pszAddon, buf, len))
+			return true;
+
+		char *pszSlash = const_cast<char *>(V_strrchr(szBase, '/'));
+		if (!pszSlash)
+			pszSlash = const_cast<char *>(V_strrchr(szBase, '\\'));
+		if (!pszSlash)
+			break;
+		*pszSlash = '\0';
+	}
+
+	BuildAddonPath(pszAddon, buf, len, false);
+	if (FileExistsAny(buf))
+	{
+		BuildAddonPath(pszAddon, buf, len, true);
+		return true;
+	}
+
+	BuildAddonPath(pszAddon, buf, len, true);
+	if (FileExistsAny(buf))
+		return true;
+
+	return false;
+}
+
+bool MultiAddonManager::GetAddonInstallMeta(PublishedFileId_t iAddon, uint64 &nSizeOnDisk, uint32 &nTimeStamp, char *pszFolder, size_t nFolderLen)
 {
 	nSizeOnDisk = 0;
 	nTimeStamp = 0;
+	if (pszFolder && nFolderLen)
+		pszFolder[0] = '\0';
 
 	ISteamUGC *pUGC = GetSteamUGC();
 	if (!pUGC)
 		return false;
 
-	char szFolder[MAX_PATH];
-	return pUGC->GetItemInstallInfo(iAddon, &nSizeOnDisk, szFolder, sizeof(szFolder), &nTimeStamp);
+	char szFolder[MAX_PATH] = {};
+	if (!pUGC->GetItemInstallInfo(iAddon, &nSizeOnDisk, szFolder, sizeof(szFolder), &nTimeStamp))
+		return false;
+
+	if (pszFolder && nFolderLen)
+		V_strncpy(pszFolder, szFolder, nFolderLen);
+
+	return true;
+}
+
+bool MultiAddonManager::IsSteamReadyForAddons()
+{
+	if (!GetSteamUGC() || m_bPendingSteamRefresh)
+		return false;
+
+	if (!g_pEngineServer->IsDedicatedServer())
+		return true;
+
+	ISteamGameServer *pGameServer = SteamGameServer();
+	return pGameServer && pGameServer->BLoggedOn();
 }
 
 bool MultiAddonManager::MountAddon(const char *pszAddon, bool bAddToTail, bool bCheckForUpdates)
@@ -531,8 +686,15 @@ bool MultiAddonManager::MountAddon(const char *pszAddon, bool bAddToTail, bool b
 		return false;
 	}
 
+	ISteamUGC *pUGC = GetSteamUGC();
+	if (!pUGC)
+	{
+		Panic("%s: Steam UGC is not ready, cannot mount addon %s\n", __func__, pszAddon);
+		return false;
+	}
+
 	PublishedFileId_t iAddon = V_StringToUint64(pszAddon, 0);
-	uint32 iAddonState = GetSteamUGC()->GetItemState(iAddon);
+	uint32 iAddonState = pUGC->GetItemState(iAddon);
 
 	if (iAddonState & k_EItemStateLegacyItem)
 	{
@@ -562,7 +724,15 @@ bool MultiAddonManager::MountAddon(const char *pszAddon, bool bAddToTail, bool b
 	char pszPath[MAX_PATH];
 	if (!ResolveAddonPath(pszAddon, pszPath, sizeof(pszPath)))
 	{
-		Panic("%s: Addon %s not found at %s\n", __func__, pszAddon, pszPath);
+		char szInstallFolder[MAX_PATH] = {};
+		uint64 nIgnoredSize = 0;
+		uint32 nIgnoredTime = 0;
+		GetAddonInstallMeta(iAddon, nIgnoredSize, nIgnoredTime, szInstallFolder, sizeof(szInstallFolder));
+
+		Panic("%s: Addon %s not found on disk (install_folder='%s', tried='%s'), queuing re-download\n",
+			__func__, pszAddon, szInstallFolder[0] ? szInstallFolder : "<none>", pszPath[0] ? pszPath : "<empty>");
+		DownloadAddon(pszAddon, true, true);
+		m_AddonNextMountAttempt[pszAddon] = Plat_FloatTime() + 15.0;
 		return false;
 	}
 
@@ -574,7 +744,7 @@ bool MultiAddonManager::MountAddon(const char *pszAddon, bool bAddToTail, bool b
 	{
 		auto it = m_AddonMountMeta.find(pszAddon);
 		const bool bHasMeta = it != m_AddonMountMeta.end();
-		const bool bPathExists = g_pFullFileSystem->FileExists(pszPath);
+		const bool bPathExists = AddonSearchPathExists(pszPath);
 		const bool bMetaChanged = bHasMeta && (it->second.sizeOnDisk != nSizeOnDisk || it->second.timeStamp != nTimeStamp);
 
 		if (bPathExists && bHasMeta && !bMetaChanged)
@@ -585,12 +755,15 @@ bool MultiAddonManager::MountAddon(const char *pszAddon, bool bAddToTail, bool b
 		UnmountAddon(pszAddon);
 	}
 
-	Message("Adding search path: %s (size=%llu, timestamp=%u)\n", pszPath, (unsigned long long)nSizeOnDisk, nTimeStamp);
+	Message("Mounting addon %s -> %s (size=%llu, timestamp=%u)\n",
+		pszAddon, pszPath, (unsigned long long)nSizeOnDisk, nTimeStamp);
 
 	g_pFullFileSystem->AddSearchPath(pszPath, "GAME", bAddToTail ? PATH_ADD_TO_TAIL : PATH_ADD_TO_HEAD, SEARCH_PATH_PRIORITY_VPK);
 	m_MountedAddons.AddToTail(pszAddon);
 	m_AddonMountMeta[pszAddon] = { pszPath, nSizeOnDisk, nTimeStamp };
+	m_AddonNextMountAttempt.erase(pszAddon);
 
+	Message("Addon %s mounted successfully\n", pszAddon);
 	return true;
 }
 
@@ -749,14 +922,20 @@ void MultiAddonManager::RequestRefreshAddons(bool bReloadMap)
 
 void MultiAddonManager::CheckMountedAddons()
 {
-	if (!GetSteamUGC() || m_ExtraAddons.Count() == 0)
+	if (!IsSteamReadyForAddons() || m_ExtraAddons.Count() == 0)
 		return;
+
+	const double flNow = Plat_FloatTime();
 
 	FOR_EACH_VEC(m_ExtraAddons, i)
 	{
 		const char *pszAddon = m_ExtraAddons[i].c_str();
 		PublishedFileId_t iAddon = V_StringToUint64(pszAddon, 0);
 		if (!iAddon)
+			continue;
+
+		auto nextIt = m_AddonNextMountAttempt.find(pszAddon);
+		if (nextIt != m_AddonNextMountAttempt.end() && flNow < nextIt->second)
 			continue;
 
 		uint32 iAddonState = GetSteamUGC()->GetItemState(iAddon);
@@ -776,6 +955,7 @@ void MultiAddonManager::CheckMountedAddons()
 			if (m_MountedAddons.Find(pszAddon) != -1)
 				UnmountAddon(pszAddon);
 			DownloadAddon(pszAddon, true, true);
+			m_AddonNextMountAttempt[pszAddon] = flNow + 15.0;
 			continue;
 		}
 
@@ -786,7 +966,8 @@ void MultiAddonManager::CheckMountedAddons()
 				Message("Addon %s was mounted but is no longer installed, remounting\n", pszAddon);
 				UnmountAddon(pszAddon);
 			}
-			MountAddon(pszAddon);
+			if (!MountAddon(pszAddon))
+				m_AddonNextMountAttempt[pszAddon] = flNow + 15.0;
 			continue;
 		}
 
@@ -797,15 +978,19 @@ void MultiAddonManager::CheckMountedAddons()
 		if (!bMounted)
 		{
 			Message("Addon %s is listed but not mounted, mounting\n", pszAddon);
-			MountAddon(pszAddon);
+			if (!MountAddon(pszAddon))
+				m_AddonNextMountAttempt[pszAddon] = flNow + 15.0;
 			continue;
 		}
 
-		if (!bPathResolved || !g_pFullFileSystem->FileExists(pszPath))
+		// ResolveAddonPath already verified *_dir.vpk / *.vpk exists. Do not FileExists the
+		// AddSearchPath stem (*.vpk) — multi-chunk addons only have *_dir.vpk on disk.
+		if (!bPathResolved)
 		{
 			Message("Addon %s was mounted but files are missing, remounting\n", pszAddon);
 			UnmountAddon(pszAddon);
-			MountAddon(pszAddon);
+			if (!MountAddon(pszAddon))
+				m_AddonNextMountAttempt[pszAddon] = flNow + 15.0;
 			continue;
 		}
 
@@ -828,7 +1013,8 @@ void MultiAddonManager::CheckMountedAddons()
 				(unsigned long long)it->second.sizeOnDisk, (unsigned long long)nSizeOnDisk,
 				it->second.timeStamp, nTimeStamp);
 			UnmountAddon(pszAddon);
-			MountAddon(pszAddon);
+			if (!MountAddon(pszAddon))
+				m_AddonNextMountAttempt[pszAddon] = flNow + 15.0;
 		}
 	}
 }
@@ -844,11 +1030,11 @@ void MultiAddonManager::ClearAddons()
 		UnmountAddon(m_MountedAddons.Tail().c_str());
 }
 
-void MultiAddonManager::Hook_GameServerSteamAPIActivated()
+KHook::Return<void> MultiAddonManager::Hook_GameServerSteamAPIActivated(ISource2Server*)
 {
 	// This is only intended for dedicated servers
 	if (!g_pEngineServer->IsDedicatedServer())
-		RETURN_META(MRES_IGNORED);
+		return { KHook::Action::Ignore };
 
 	Message("Steam API Activated\n");
 
@@ -859,7 +1045,7 @@ void MultiAddonManager::Hook_GameServerSteamAPIActivated()
 	m_bPendingReloadMap = true;
 	RequestRefreshAddons(true);
 
-	RETURN_META(MRES_IGNORED);
+	return { KHook::Action::Ignore };
 }
 
 void MultiAddonManager::ReloadMap()
@@ -1181,7 +1367,7 @@ CON_COMMAND_F(mm_print_searchpaths_client, "Print search paths client-side, only
 	g_pFullFileSystem->PrintSearchPaths();
 }
 
-void MultiAddonManager::Hook_StartupServer(const GameSessionConfiguration_t &config, ISource2WorldSession *session, const char *mapname)
+KHook::Return<void> MultiAddonManager::Hook_StartupServer(INetworkServerService*, const GameSessionConfiguration_t &config, ISource2WorldSession *session, const char *mapname)
 {
 	gpGlobals = g_pEngineServer->GetServerGlobals();
 	g_pNetworkGameServer = g_pNetworkServerService->GetIGameServer();
@@ -1196,6 +1382,7 @@ void MultiAddonManager::Hook_StartupServer(const GameSessionConfiguration_t &con
 	// So if the current map is ID 1 and extra addons are IDs 2 and 3, they would be mounted in that order with ID 3 at the top
 	// Note that the actual map VPK(s) and any sub-maps like team_select will be even higher, but those usually don't contain any assets that concern us
 	RequestRefreshAddons();
+	return { KHook::Action::Ignore };
 }
 
 bool FASTCALL Hook_SendNetMessage(CServerSideClientBase *pClient, CNetMessage *pData, NetChannelBufType_t bufType, SendNetMessage_t pOriginalFunc)
@@ -1363,33 +1550,35 @@ void MultiAddonManager::CheckClientAddons(uint64 steamID64)
 	return;
 }
 
-bool MultiAddonManager::Hook_ClientConnect( CPlayerSlot slot, const char *pszName, uint64 steamID64, const char *pszNetworkID, bool unk1, CBufferString *pRejectReason )
+KHook::Return<bool> MultiAddonManager::Hook_ClientConnect(IServerGameClients*, CPlayerSlot slot, const char *pszName, uint64 steamID64, const char *pszNetworkID, bool unk1, CBufferString *pRejectReason )
 {
 	CheckClientAddons(steamID64);
-	RETURN_META_VALUE(MRES_IGNORED, true);
+	return { KHook::Action::Ignore };
 }
 
-bool MultiAddonManager::Hook_CanHLTVClientConnect(int index, const CSteamID &steamID, int *pRejectReason)
+KHook::Return<bool> MultiAddonManager::Hook_CanHLTVClientConnect(IServerGameClients*, int index, const CSteamID &steamID, int *pRejectReason)
 {
 	CheckClientAddons(steamID.ConvertToUint64());
-	RETURN_META_VALUE(MRES_IGNORED, true);
+	return { KHook::Action::Ignore };
 }
 
-void MultiAddonManager::Hook_ClientDisconnect( CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID )
+KHook::Return<void> MultiAddonManager::Hook_ClientDisconnect(IServerGameClients*, CPlayerSlot slot, ENetworkDisconnectionReason reason, const char *pszName, uint64 steamID64, const char *pszNetworkID )
 {
 	// Mark the disconnection time for caching purposes.
 	g_ClientAddons[steamID64].lastActiveTime = Plat_FloatTime();
 	g_ClientAddons[steamID64].connectedState = CLIENTCONN_NONE;
+	return { KHook::Action::Ignore };
 }
 
-void MultiAddonManager::Hook_ClientActive(CPlayerSlot slot, bool bLoadGame, const char * pszName, uint64 steamID64)
+KHook::Return<void> MultiAddonManager::Hook_ClientActive(IServerGameClients*, CPlayerSlot slot, bool bLoadGame, const char * pszName, uint64 steamID64)
 {
 	// When the client reaches this stage, they should already have all the necessary addons downloaded, so we can safely remove the downloaded addons list here.
 	if (!mm_cache_clients_with_addons.Get())
 		g_ClientAddons[steamID64].downloadedAddons.RemoveAll();
+	return { KHook::Action::Ignore };
 }
 
-void MultiAddonManager::Hook_GameFrame(bool simulating, bool bFirstTick, bool bLastTick)
+KHook::Return<void> MultiAddonManager::Hook_GameFrame(ISource2Server*, bool simulating, bool bFirstTick, bool bLastTick)
 {
 	static double s_flTime = 0.0f;
 
@@ -1418,7 +1607,7 @@ void MultiAddonManager::Hook_GameFrame(bool simulating, bool bFirstTick, bool bL
 	}
 
 	if (!m_TimedOutClients.size())
-		return;
+		return { KHook::Action::Ignore };
 
 	auto pClients = GetClientList();
 
@@ -1434,9 +1623,10 @@ void MultiAddonManager::Hook_GameFrame(bool simulating, bool bFirstTick, bool bL
 			g_ClientAddons[steamID64].connectedState = CLIENTCONN_NONE;
 		}
 	}
+	return { KHook::Action::Ignore };
 }
 
-void MultiAddonManager::Hook_PostEvent(CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCount, const uint64 *clients,
+KHook::Return<void> MultiAddonManager::Hook_PostEvent(IGameEventSystem*, CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCount, const uint64 *clients,
 	INetworkMessageInternal *pEvent, const CNetMessage *pData, unsigned long nSize, NetChannelBufType_t bufType)
 {
 	NetMessageInfo_t *info = pEvent->GetNetMessageInfo();
@@ -1458,15 +1648,15 @@ void MultiAddonManager::Hook_PostEvent(CSplitScreenSlot nSlot, bool bLocalOnly, 
 		}
 	}
 
-	RETURN_META(MRES_IGNORED);
+	return { KHook::Action::Ignore };
 }
 
-int MultiAddonManager::Hook_LoadEventsFromFile(const char *filename, bool bSearchAll)
+KHook::Return<int> MultiAddonManager::Hook_LoadEventsFromFile(IGameEventManager2* pThis, const char *filename, bool bSearchAll)
 {
-	if (!g_pGameEventManager)
-		g_pGameEventManager = META_IFACEPTR(IGameEventManager2);
+	if (!g_pGameEventManager && pThis)
+		g_pGameEventManager = pThis;
 
-	RETURN_META_VALUE(MRES_IGNORED, 0);
+	return { KHook::Action::Ignore };
 }
 
 void FASTCALL Hook_ReplyConnection(INetworkGameServer *server, CServerSideClient *client)
