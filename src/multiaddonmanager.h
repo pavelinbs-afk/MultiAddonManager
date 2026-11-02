@@ -63,6 +63,7 @@ public: //hooks (first arg = hooked this; KHook MM 2.0)
 	KHook::Return<bool> Hook_CanHLTVClientConnect(IServerGameClients*, int index, const CSteamID &steamID, int *pRejectReason);
 
 	void ParseCfg();
+	void PrintStatus();
 	void BuildAddonPath(const char *pszAddon, char *buf, size_t len, bool bLegacy);
 	bool ResolveAddonPath(const char *pszAddon, char *buf, size_t len);
 	bool GetAddonInstallMeta(PublishedFileId_t iAddon, uint64 &nSizeOnDisk, uint32 &nTimeStamp, char *pszFolder = nullptr, size_t nFolderLen = 0);
@@ -97,7 +98,7 @@ public:
 	const char *GetDescription() override	{ return "Multi Addon Manager"; }
 	const char *GetURL() override			{ return "https://github.com/Source2ZE/MultiAddonManager"; }
 	const char *GetLicense() override		{ return "GPL v3 License"; }
-	const char *GetVersion() override		{ return "1.2.3.0"; }
+	const char *GetVersion() override		{ return "1.2.4.1"; }
 	const char *GetDate() override			{ return __DATE__; }
 	const char *GetLogTag() override		{ return "MultiAddonManager"; }
 

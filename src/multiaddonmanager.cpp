@@ -476,17 +476,18 @@ void *MultiAddonManager::OnMetamodQuery(const char *iface, int *ret)
 
 void MultiAddonManager::ParseCfg()
 {
+	// Expected path: <Plat_GetGameDirectory()>/csgo/cfg/multiaddonmanager/multiaddonmanager.cfg
 	char szPath[MAX_PATH];
 	V_snprintf(szPath, sizeof(szPath), "%s/csgo/cfg/multiaddonmanager/multiaddonmanager.cfg", Plat_GetGameDirectory());
 	std::ifstream cfgFile(szPath);
 
 	if (!cfgFile.is_open())
 	{
-		Message("Unable to open & execute custom cfg file \"multiaddonmanager/multiaddonmanager\"\n");
+		Panic("Unable to open & execute config at \"%s\"\n", szPath);
 		return;
 	}
 
-	Message("Executing custom cfg file \"multiaddonmanager/multiaddonmanager\"\n");
+	Message("Executing config at \"%s\"\n", szPath);
 
 	std::string strCommand;
 
@@ -495,9 +496,194 @@ void MultiAddonManager::ParseCfg()
 		if (!strCommand.empty() && strCommand.back() == '\r')
 			strCommand.pop_back();
 
-		if (!strCommand.empty())
-			g_pEngineServer->ServerCommand(strCommand.c_str());
+		// Apply immediately. ServerCommand only queues into the buffer and does not
+		// reliably strip trailing // comments, so mm_extra_addons stayed empty and
+		// RefreshAddons() logged an empty list.
+		CCommand args;
+		if (!args.Tokenize(strCommand.c_str()))
+			continue;
+
+		const char *pszCommand = args.Arg(0);
+		if (!pszCommand || !*pszCommand)
+			continue;
+
+		ConVarRefAbstract cvarRef(pszCommand, true);
+		if (cvarRef.IsValidRef())
+		{
+			cvarRef.SetString(args.ArgC() > 1 ? args.Arg(1) : "");
+			continue;
+		}
+
+		ConCommandRef cmdRef(pszCommand, true);
+		if (cmdRef.IsValidRef())
+		{
+			CCommandContext ctx(CT_FIRST_SPLITSCREEN_CLIENT, -1);
+			cmdRef.Dispatch(ctx, args);
+		}
 	}
+
+	Message("Config applied, mm_extra_addons = \"%s\"\n", mm_extra_addons.Get().Get());
+}
+
+static void FormatItemState(uint32 state, char *buf, size_t len)
+{
+	if (!buf || len == 0)
+		return;
+
+	buf[0] = '\0';
+	auto append = [&](const char *flag)
+	{
+		if (buf[0])
+			V_strcat(buf, "|", len);
+		V_strcat(buf, flag, len);
+	};
+
+	if (state == k_EItemStateNone)
+	{
+		V_strncpy(buf, "None", len);
+		return;
+	}
+	if (state & k_EItemStateSubscribed) append("Subscribed");
+	if (state & k_EItemStateLegacyItem) append("Legacy");
+	if (state & k_EItemStateInstalled) append("Installed");
+	if (state & k_EItemStateNeedsUpdate) append("NeedsUpdate");
+	if (state & k_EItemStateDownloading) append("Downloading");
+	if (state & k_EItemStateDownloadPending) append("DownloadPending");
+	if (!buf[0])
+		V_snprintf(buf, len, "0x%X", state);
+}
+
+void MultiAddonManager::PrintStatus()
+{
+	char szCfgPath[MAX_PATH];
+	V_snprintf(szCfgPath, sizeof(szCfgPath), "%s/csgo/cfg/multiaddonmanager/multiaddonmanager.cfg", Plat_GetGameDirectory());
+
+	std::ifstream cfgFile(szCfgPath);
+	const bool bCfgExists = cfgFile.good();
+	cfgFile.close();
+
+	const bool bDedicated = g_pEngineServer->IsDedicatedServer();
+	ISteamGameServer *pGameServer = bDedicated ? SteamGameServer() : nullptr;
+	const bool bLoggedOn = !bDedicated || (pGameServer && pGameServer->BLoggedOn());
+	ISteamUGC *pUGC = GetSteamUGC();
+	const bool bSteamReady = IsSteamReadyForAddons();
+
+	Message("========== MultiAddonManager status ==========\n");
+	Message("Version: %s (%s)\n", GetVersion(), GetDate());
+	Message("Game directory: %s\n", Plat_GetGameDirectory());
+	Message("Config path: %s\n", szCfgPath);
+	Message("Config file: %s\n", bCfgExists ? "found" : "MISSING");
+	Message("Server: %s\n", bDedicated ? "dedicated" : "listen");
+	Message("Map: %s\n", gpGlobals ? gpGlobals->mapname.ToCStr() : "(none)");
+	Message("Workshop map: %s\n", m_sCurrentWorkshopMap.empty() ? "(none)" : m_sCurrentWorkshopMap.c_str());
+
+	Message("--- Steam ---\n");
+	Message("UGC interface: %s\n", pUGC ? "ready" : "not ready");
+	Message("Gameserver logged on: %s\n", bLoggedOn ? "yes" : "no");
+	Message("Steam ready for addons: %s\n", bSteamReady ? "yes" : "no");
+	Message("Pending refresh: %s (reload map: %s)\n",
+		m_bPendingSteamRefresh ? "yes" : "no",
+		m_bPendingReloadMap ? "yes" : "no");
+	if (m_flSteamApiActivatedTime > 0.0)
+	{
+		const double flElapsed = Plat_FloatTime() - m_flSteamApiActivatedTime;
+		Message("Steam activated %.1fs ago (refresh delay %.1fs)\n", flElapsed, mm_steam_refresh_delay.Get());
+	}
+	else
+	{
+		Message("Steam API not activated yet\n");
+	}
+
+	Message("--- ConVars ---\n");
+	Message("mm_extra_addons = \"%s\"\n", mm_extra_addons.Get().Get());
+	Message("mm_client_extra_addons = \"%s\"\n", mm_client_extra_addons.Get().Get());
+	Message("mm_addon_mount_download = %d\n", mm_addon_mount_download.Get() ? 1 : 0);
+	Message("mm_steam_refresh_delay = %.1f\n", mm_steam_refresh_delay.Get());
+	Message("mm_addon_debug = %d\n", mm_addon_debug.Get() ? 1 : 0);
+
+	Message("--- Lists ---\n");
+	Message("Configured extras: %d | Mounted: %d | Client-only: %d\n",
+		m_ExtraAddons.Count(), m_MountedAddons.Count(), m_GlobalClientAddons.Count());
+	Message("Download queue: %d | Important downloads: %d\n",
+		m_DownloadQueue.Count(), m_ImportantDownloads.Count());
+
+	if (m_ExtraAddons.Count() == 0)
+	{
+		Message("No extra addons configured.\n");
+	}
+	else
+	{
+		Message("--- Extra addons ---\n");
+		FOR_EACH_VEC(m_ExtraAddons, i)
+		{
+			const char *pszAddon = m_ExtraAddons[i].c_str();
+			const bool bMounted = m_MountedAddons.Find(pszAddon) != -1;
+			const bool bWorkshopMap = (m_sCurrentWorkshopMap == pszAddon);
+
+			char szPath[MAX_PATH] = {};
+			const bool bPathOk = ResolveAddonPath(pszAddon, szPath, sizeof(szPath));
+
+			uint64 nSize = 0;
+			uint32 nTime = 0;
+			char szInstallFolder[MAX_PATH] = {};
+			PublishedFileId_t iAddon = V_StringToUint64(pszAddon, 0);
+			const bool bMeta = iAddon && GetAddonInstallMeta(iAddon, nSize, nTime, szInstallFolder, sizeof(szInstallFolder));
+
+			char szState[128] = {};
+			if (pUGC && iAddon)
+				FormatItemState(pUGC->GetItemState(iAddon), szState, sizeof(szState));
+			else
+				V_strncpy(szState, "n/a", sizeof(szState));
+
+			Message("[%d] %s | mounted=%s%s | files=%s | ugc=%s\n",
+				i,
+				pszAddon,
+				bMounted ? "yes" : "no",
+				bWorkshopMap ? " (workshop map)" : "",
+				bPathOk ? "ok" : "MISSING",
+				szState);
+
+			if (bPathOk)
+				Message("    search path: %s\n", szPath);
+			if (bMeta)
+			{
+				Message("    install: %s\n", szInstallFolder[0] ? szInstallFolder : "(unknown)");
+				Message("    size=%llu bytes, timestamp=%u\n",
+					static_cast<unsigned long long>(nSize), nTime);
+			}
+
+			auto metaIt = m_AddonMountMeta.find(pszAddon);
+			if (metaIt != m_AddonMountMeta.end())
+			{
+				Message("    mount meta: path=%s size=%llu ts=%u\n",
+					metaIt->second.path.c_str(),
+					static_cast<unsigned long long>(metaIt->second.sizeOnDisk),
+					metaIt->second.timeStamp);
+			}
+
+			auto nextIt = m_AddonNextMountAttempt.find(pszAddon);
+			if (nextIt != m_AddonNextMountAttempt.end() && Plat_FloatTime() < nextIt->second)
+			{
+				Message("    next mount retry in %.1fs\n", nextIt->second - Plat_FloatTime());
+			}
+		}
+	}
+
+	if (m_MountedAddons.Count() > 0)
+	{
+		Message("--- Mounted (plugin) ---\n");
+		FOR_EACH_VEC(m_MountedAddons, i)
+			Message("  %s\n", m_MountedAddons[i].c_str());
+	}
+
+	if (m_GlobalClientAddons.Count() > 0)
+	{
+		Message("--- Client-only addons ---\n");
+		FOR_EACH_VEC(m_GlobalClientAddons, i)
+			Message("  %s\n", m_GlobalClientAddons[i].c_str());
+	}
+
+	Message("==============================================\n");
 }
 
 void MultiAddonManager::BuildAddonPath(const char *pszAddon, char *buf, size_t len, bool bLegacy = false)
@@ -1355,6 +1541,11 @@ CON_COMMAND_F(mm_download_addon, "Download an addon manually", FCVAR_SPONLY)
 	}
 
 	g_MultiAddonManager.DownloadAddon(args[1], false, true);
+}
+
+CON_COMMAND_F(mam_status, "Print MultiAddonManager status, config path and addon details", FCVAR_SPONLY)
+{
+	g_MultiAddonManager.PrintStatus();
 }
 
 CON_COMMAND_F(mm_print_searchpaths, "Print search paths", FCVAR_SPONLY)
