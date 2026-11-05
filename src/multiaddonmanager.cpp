@@ -186,7 +186,8 @@ constexpr const byte g_ReplyConnection_Sig[] = "\x48\x8B\xC4\x55\x41\x55\x41\x56
 constexpr const byte g_ScriptGetAddon_Sig[] = "\x40\x56\x48\x83\xEC\x2A\x48\x8B\x0D\x2A\x2A\x2A\x2A\x48\x8D\x54\x24";
 #else
 constexpr const byte g_HostStateRequest_Sig[] = "\x55\x48\x89\xE5\x41\x56\x41\x55\x41\x54\x49\x89\xF4\x53\x48\x83\x7F";
-constexpr const byte g_ReplyConnection_Sig[] = "\x55\xB9\x2A\x2A\x2A\x2A\x41\xB8";
+// Extended upstream (#79): "55 B9 ? ? ? ? 41 B8 ? ? ? ? 48 89 E5"
+constexpr const byte g_ReplyConnection_Sig[] = "\x55\xB9\x2A\x2A\x2A\x2A\x41\xB8\x2A\x2A\x2A\x2A\x48\x89\xE5";
 constexpr const byte g_ScriptGetAddon_Sig[] = "\x55\x48\x89\xE5\x41\x55\x41\x54\x48\x8D\x75\x2A\x53\x48\x83\xEC\x2A\x48\x8D\x05\x2A\x2A\x2A\x2A\x48\xC7\x45\x2A\x2A\x2A\x2A\x2A\x48\xC7\x45\x2A\x2A\x2A\x2A\x2A\x48\x8B\x38\x48\x8B\x07\xFF\x90\x2A\x2A\x2A\x2A\x8B\x55";
 #endif
 
@@ -390,14 +391,17 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 	AddGlobalByVtbl(m_LoadEventsFromFile, g_pEventMgrVtbl);
 	g_iLoadEventsFromFileHookId = 1; // non-zero = hooked (compat with old id check)
 
+	// Register Steam callbacks on load (upstream b1e4275), not only on late-load.
+	if (g_pEngineServer->IsDedicatedServer())
+	{
+		m_CallbackDownloadItemResult.Register(this, &MultiAddonManager::OnAddonDownloaded);
+		m_CallbackSteamServersConnected.Register(this, &MultiAddonManager::OnSteamServersConnected);
+	}
+
 	if (late)
 	{
 		g_pNetworkGameServer = g_pNetworkServerService->GetIGameServer();
 		gpGlobals = g_pEngineServer->GetServerGlobals();
-		if (g_pEngineServer->IsDedicatedServer())
-		{
-			m_CallbackDownloadItemResult.Register(this, &MultiAddonManager::OnAddonDownloaded);
-		}
 	}
 
 	META_CONVAR_REGISTER(FCVAR_RELEASE);
@@ -412,6 +416,9 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 bool MultiAddonManager::Unload(char *error, size_t maxlen)
 {
 	ClearAddons();
+
+	m_CallbackDownloadItemResult.Unregister();
+	m_CallbackSteamServersConnected.Unregister();
 
 	m_GameServerSteamAPIActivated.Remove(g_pSource2Server);
 	m_StartupServer.Remove(g_pNetworkServerService);
@@ -576,11 +583,14 @@ void MultiAddonManager::PrintStatus()
 	Message("Server: %s\n", bDedicated ? "dedicated" : "listen");
 	Message("Map: %s\n", gpGlobals ? gpGlobals->mapname.ToCStr() : "(none)");
 	Message("Workshop map: %s\n", m_sCurrentWorkshopMap.empty() ? "(none)" : m_sCurrentWorkshopMap.c_str());
+	Message("Loading workshop map: %s\n", m_sLoadingWorkshopMap.empty() ? "(none)" : m_sLoadingWorkshopMap.c_str());
 
 	Message("--- Steam ---\n");
 	Message("UGC interface: %s\n", pUGC ? "ready" : "not ready");
+	Message("SteamServersConnected callback: %s\n", m_bSteamConnected ? "yes" : "no");
 	Message("Gameserver logged on: %s\n", bLoggedOn ? "yes" : "no");
 	Message("Steam ready for addons: %s\n", bSteamReady ? "yes" : "no");
+	Message("Pre-login download retries: %d\n", m_PreSteamLoginDownloads.Count());
 	Message("Pending refresh: %s (reload map: %s)\n",
 		m_bPendingSteamRefresh ? "yes" : "no",
 		m_bPendingReloadMap ? "yes" : "no");
@@ -1049,6 +1059,12 @@ bool MultiAddonManager::DownloadAddon(const char *pszAddon, bool bImportant, boo
 	if (!GetSteamUGC()->DownloadItem(addon, false))
 	{
 		Panic("%s: Addon download for %lli failed to start, addon ID is invalid or server is not logged on Steam\n", __func__, addon);
+
+		// Most likely the server hasn't logged on to Steam yet; retry in OnSteamServersConnected
+		AddonDownloadInfo_t pending = { pszAddon, bImportant, bForce };
+		if (m_PreSteamLoginDownloads.Find(pending) == -1)
+			m_PreSteamLoginDownloads.AddToTail(pending);
+
 		return false;
 	}
 	
@@ -1060,6 +1076,31 @@ bool MultiAddonManager::DownloadAddon(const char *pszAddon, bool bImportant, boo
 	Message("Addon download started for %lli\n", addon);
 
 	return true;
+}
+
+void MultiAddonManager::OnSteamServersConnected(SteamServersConnected_t *pResult)
+{
+	Message("Logged on to Steam\n");
+
+	m_bSteamConnected = true;
+
+	if (m_PreSteamLoginDownloads.Count() == 0)
+	{
+		// Still request a deferred refresh — downloads may already be queued elsewhere
+		RequestRefreshAddons(false);
+		return;
+	}
+
+	Message("Retrying %i pending addon download(s)\n", m_PreSteamLoginDownloads.Count());
+
+	CUtlVector<AddonDownloadInfo_t> pending;
+	pending.AddVectorToTail(m_PreSteamLoginDownloads);
+	m_PreSteamLoginDownloads.RemoveAll();
+
+	FOR_EACH_VEC(pending, i)
+		DownloadAddon(pending[i].addon.c_str(), pending[i].bImportant, pending[i].bForce);
+
+	RequestRefreshAddons(false);
 }
 
 void MultiAddonManager::RefreshAddons(bool bReloadMap)
@@ -1224,9 +1265,8 @@ KHook::Return<void> MultiAddonManager::Hook_GameServerSteamAPIActivated(ISource2
 
 	Message("Steam API Activated\n");
 
-	m_CallbackDownloadItemResult.Register(this, &MultiAddonManager::OnAddonDownloaded);
-
 	// GameServerSteamAPIActivated fires before the gameserver finishes logging on to Steam.
+	// Download callbacks are already registered in Load; wait for logon / mm_steam_refresh_delay.
 	m_flSteamApiActivatedTime = Plat_FloatTime();
 	m_bPendingReloadMap = true;
 	RequestRefreshAddons(true);
@@ -1252,9 +1292,24 @@ void MultiAddonManager::ReloadMap()
 void MultiAddonManager::OnAddonDownloaded(DownloadItemResult_t *pResult)
 {
 	if (pResult->m_eResult == k_EResultOK)
+	{
 		Message("Addon %lli downloaded successfully\n", pResult->m_nPublishedFileId);
+	}
 	else
-		Panic("Addon %lli download failed with reason \"%s\" (%i)\n", pResult->m_nPublishedFileId, g_SteamErrorMessages[pResult->m_eResult], pResult->m_eResult);
+	{
+		static const int iNumMessages = static_cast<int>(sizeof(g_SteamErrorMessages) / sizeof(g_SteamErrorMessages[0]));
+		const char *pszReason = (pResult->m_eResult >= 0 && pResult->m_eResult < iNumMessages)
+			? g_SteamErrorMessages[pResult->m_eResult]
+			: "Unknown error";
+		Panic("Addon %lli download failed with reason \"%s\" (%i)\n", pResult->m_nPublishedFileId, pszReason, pResult->m_eResult);
+	}
+
+	// Drop any matching pre-login retry entry
+	FOR_EACH_VEC_BACK(m_PreSteamLoginDownloads, i)
+	{
+		if (V_StringToUint64(m_PreSteamLoginDownloads[i].addon.c_str(), 0) == pResult->m_nPublishedFileId)
+			m_PreSteamLoginDownloads.Remove(i);
+	}
 
 	// This download isn't triggered by us, don't do anything
 	if (!m_DownloadQueue.Check(pResult->m_nPublishedFileId))
@@ -1361,7 +1416,7 @@ CNetMessagePB<CNETMsg_SignonState> *GetAddonSignonStateMessage(const char *pszAd
 
 bool MultiAddonManager::HasUGCConnection()
 {
-	return GetSteamUGC() != nullptr;
+	return GetSteamUGC() != nullptr && m_bSteamConnected;
 }
 
 void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, bool bRefresh)
@@ -1401,37 +1456,46 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 		FOR_EACH_VEC(clients, i)
 		{
 			CServerSideClient *pClient = clients[i];
-			if (steamID64 == 0 || pClient->GetClientSteamID().ConvertToUint64() == steamID64)
+			uint64 clientSteamId = pClient->GetClientSteamID().ConvertToUint64();
+
+			if (steamID64 != 0 && clientSteamId != steamID64)
+				continue;
+
+			// Client is already loading, telling them to reload now will actually just disconnect them.
+			if (pClient->GetSignonState() == SIGNONSTATE_CHANGELEVEL)
 			{
-				// Client is already loading, telling them to reload now will actually just disconnect them. ("Received signon %i when at %i\n" in client console)
-				if (pClient->GetSignonState() == SIGNONSTATE_CHANGELEVEL)
-					break;
-				// Client still has addons to load anyway, they don't need to be told to reload
-				if (!g_ClientAddons[steamID64].currentPendingAddon.empty())
-					break;
-				ClientAddonInfo_t &clientInfo = g_ClientAddons[steamID64];
-
-				CUtlVector<std::string> addons;
-				g_MultiAddonManager.GetClientAddons(addons, steamID64);
-				
-				FOR_EACH_VEC(clientInfo.downloadedAddons, j)
-				{
-					addons.FindAndRemove(clientInfo.downloadedAddons[j]);
-				}
-
-				if (!addons.Count())
-				{
-					break;
-				}
-				clientInfo.currentPendingAddon = addons.Head();
-				
-				pClient->GetNetChannel()->SendNetMessage(pMsg, BUF_RELIABLE);
-
 				if (steamID64)
-				{
 					break;
-				}
+				continue;
 			}
+			// Client still has addons to load anyway, they don't need to be told to reload
+			if (!g_ClientAddons[clientSteamId].currentPendingAddon.empty())
+			{
+				if (steamID64)
+					break;
+				continue;
+			}
+
+			ClientAddonInfo_t &clientInfo = g_ClientAddons[clientSteamId];
+
+			CUtlVector<std::string> addons;
+			GetClientAddons(addons, clientSteamId);
+
+			FOR_EACH_VEC(clientInfo.downloadedAddons, j)
+				addons.FindAndRemove(clientInfo.downloadedAddons[j]);
+
+			if (!addons.Count())
+			{
+				if (steamID64)
+					break;
+				continue;
+			}
+
+			clientInfo.currentPendingAddon = addons.Head();
+			pClient->GetNetChannel()->SendNetMessage(pMsg, BUF_RELIABLE);
+
+			if (steamID64)
+				break;
 		}
 		delete pMsg;
 	}
@@ -1565,6 +1629,9 @@ KHook::Return<void> MultiAddonManager::Hook_StartupServer(INetworkServerService*
 
 	m_TimedOutClients.clear();
 
+	// Upstream commits LoadingWorkshopMap in SwitchToLoop("levelload"); StartupServer is our equivalent.
+	CommitLoadingWorkshopMap();
+
 	// Remove empty paths added when there are 2+ addons, they screw up file writes
 	g_pFullFileSystem->RemoveSearchPath("", "GAME");
 	g_pFullFileSystem->RemoveSearchPath("", "DEFAULT_WRITE_PATH");
@@ -1656,7 +1723,12 @@ void FASTCALL Hook_SetPendingHostStateRequest(CHostStateMgr* pMgrDoNotUse, CHost
 	// (which happens at the end of a map), the server-defined addon does not change.
 	// Also, host state requests coming from that function will always have "ChangeLevel" in its KV's name.
 	// We can use this information to always be aware of what the original addon is.
-	
+	//
+	// Upstream (4e15151/3e04eff): track a *loading* workshop map here and only commit it when
+	// the level actually starts (SwitchToLoop). We commit in Hook_StartupServer instead.
+
+	g_MultiAddonManager.SetLoadingWorkshopMap(g_MultiAddonManager.GetCurrentWorkshopMap().c_str());
+
 	if (!pRequest->m_pKV)
 	{
 		// g_pEngineServer->IsMapValid takes into account mounted addons so we have to do this instead
@@ -1667,16 +1739,16 @@ void FASTCALL Hook_SetPendingHostStateRequest(CHostStateMgr* pMgrDoNotUse, CHost
 		// Workshop map changes from end of match votes have null keyvalues
 		// ...and when such votes lead to reloading the CURRENT map, m_Addons will also be null, in which case we want to keep the workshop map unchanged
 		if (!pRequest->m_Addons.IsEmpty())
-			g_MultiAddonManager.SetCurrentWorkshopMap(pRequest->m_Addons);
+			g_MultiAddonManager.SetLoadingWorkshopMap(pRequest->m_Addons);
 		else if (bValveMap) // Sadly this will include any workshop maps that share names with shipped Valve maps, but at this point there's no way to tell
-			g_MultiAddonManager.ClearCurrentWorkshopMap();
+			g_MultiAddonManager.ClearLoadingWorkshopMap();
 	}
 	else if (V_stricmp(pRequest->m_pKV->GetName(), "ChangeLevel"))
 	{
 		if (!V_stricmp(pRequest->m_pKV->GetName(), "map_workshop"))
-			g_MultiAddonManager.SetCurrentWorkshopMap(pRequest->m_pKV->GetString("customgamemode", ""));
+			g_MultiAddonManager.SetLoadingWorkshopMap(pRequest->m_pKV->GetString("customgamemode", ""));
 		else
-			g_MultiAddonManager.ClearCurrentWorkshopMap();
+			g_MultiAddonManager.ClearLoadingWorkshopMap();
 	}
 
 	// Valve changed the way community maps (like de_dogtown) are loaded
@@ -1684,13 +1756,14 @@ void FASTCALL Hook_SetPendingHostStateRequest(CHostStateMgr* pMgrDoNotUse, CHost
 	// So check if the addon is indeed one of the community maps and keep it, otherwise clients would error out due to missing assets
 	// Each map has its own folder under game/csgo_community_addons which is mounted as "OFFICIAL_ADDONS"
 	if (!pRequest->m_Addons.IsEmpty() && g_pFullFileSystem->IsDirectory(pRequest->m_Addons.String(), "OFFICIAL_ADDONS"))
-		g_MultiAddonManager.SetCurrentWorkshopMap(pRequest->m_Addons);
+		g_MultiAddonManager.SetLoadingWorkshopMap(pRequest->m_Addons);
 
 	if (g_MultiAddonManager.m_ExtraAddons.Count() == 0)
 		return g_pfnSetPendingHostStateRequest(pMgrDoNotUse, pRequest);
 
 	// Rebuild the addon list. We always start with the original addon.
-	if (g_MultiAddonManager.GetCurrentWorkshopMap().empty())
+	const std::string &loadingMap = g_MultiAddonManager.GetLoadingWorkshopMap();
+	if (loadingMap.empty())
 	{
 		pRequest->m_Addons = VectorToString(g_MultiAddonManager.m_ExtraAddons).c_str();
 	}
@@ -1699,8 +1772,8 @@ void FASTCALL Hook_SetPendingHostStateRequest(CHostStateMgr* pMgrDoNotUse, CHost
 		// Don't add the same addon twice. Hopefully no server owner is diabolical enough to do things like `map de_dust2 customgamemode=1234,5678`.
 		CUtlVector<std::string> newAddons;
 		newAddons.CopyArray(g_MultiAddonManager.m_ExtraAddons.Base(), g_MultiAddonManager.m_ExtraAddons.Count());
-		newAddons.FindAndRemove(g_MultiAddonManager.GetCurrentWorkshopMap().c_str());
-		newAddons.AddToHead(g_MultiAddonManager.GetCurrentWorkshopMap().c_str());
+		newAddons.FindAndRemove(loadingMap.c_str());
+		newAddons.AddToHead(loadingMap.c_str());
 		pRequest->m_Addons = VectorToString(newAddons).c_str();
 	}
 

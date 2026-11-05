@@ -29,6 +29,7 @@
 #include "networksystem/inetworkserializer.h"
 #include "steam/steam_api_common.h"
 #include "steam/isteamugc.h"
+#include "steam/isteamuser.h"
 #include "imultiaddonmanager.h"
 #include <set>
 #include <string>
@@ -91,6 +92,10 @@ public: //hooks (first arg = hooked this; KHook MM 2.0)
 	void GetClientAddons(CUtlVector<std::string> &addons, uint64 steamID64 = 0);
 	void CheckClientAddons(uint64 steamID64);
 	void AddTimedOutClient(uint64 steamID64) { m_TimedOutClients.insert(steamID64); }
+	std::string GetLoadingWorkshopMap() { return m_sLoadingWorkshopMap; }
+	void SetLoadingWorkshopMap(const char *pszWorkshopID) { m_sLoadingWorkshopMap = pszWorkshopID ? pszWorkshopID : ""; }
+	void ClearLoadingWorkshopMap() { m_sLoadingWorkshopMap.clear(); }
+	void CommitLoadingWorkshopMap() { m_sCurrentWorkshopMap = m_sLoadingWorkshopMap; }
 
 public:
 	const char *GetAuthor() override		{ return "xen & pRfect"; }
@@ -124,6 +129,26 @@ private:
 	std::unordered_map<std::string, double> m_AddonNextMountAttempt; // Backoff for failed mount retries
 
 	STEAM_GAMESERVER_CALLBACK_MANUAL(MultiAddonManager, OnAddonDownloaded, DownloadItemResult_t, m_CallbackDownloadItemResult);
+	STEAM_GAMESERVER_CALLBACK_MANUAL(MultiAddonManager, OnSteamServersConnected, SteamServersConnected_t, m_CallbackSteamServersConnected);
+
+	struct AddonDownloadInfo_t
+	{
+		std::string addon;
+		bool bImportant = false;
+		bool bForce = false;
+
+		bool operator==(const AddonDownloadInfo_t &o) const
+		{
+			return addon == o.addon && bImportant == o.bImportant && bForce == o.bForce;
+		}
+	};
+
+	// Downloads that failed to start because the server wasn't logged on to Steam yet
+	CUtlVector<AddonDownloadInfo_t> m_PreSteamLoginDownloads;
+	bool m_bSteamConnected = false;
+
+	// Pending workshop map from HostStateRequest; committed on StartupServer (upstream uses SwitchToLoop)
+	std::string m_sLoadingWorkshopMap;
 	// Used when reloading current map
 	std::string m_sCurrentWorkshopMap;
 
@@ -280,5 +305,9 @@ constexpr const char* g_SteamErrorMessages[] =
 	"User device doesn't have enough battery charge currently to complete the action",
 	"The operation requires a charger to be plugged in, which wasn't present",
 	"Cached credential was invalid - user must reauthenticate",
-	"The phone number provided is a Voice Over IP number"
+	"The phone number provided is a Voice Over IP number",
+	"The data being accessed is not supported by this API",
+	"Reached the maximum size of the family",
+	"The local data for the offline mode cache is insufficient to login",
+	"Retry the operation later",
 };
