@@ -192,9 +192,11 @@ constexpr const byte g_ScriptGetAddon_Sig[] = "\x55\x48\x89\xE5\x41\x55\x41\x54\
 #endif
 
 
-// Offsets
-constexpr int g_iServerAddonsOffset = 344;
-constexpr int g_iClientListOffset = 584;
+// Offsets (cf61a1c / 23-09-2026). Writing the old 344/584 values after that update
+// corrupts CNetworkGameServer and crashes in ReplyConnection / client list walks.
+// Upstream later dropped these for s2sdk m_szAddonName / m_Clients; keep last known values.
+constexpr int g_iServerAddonsOffset = 376;
+constexpr int g_iClientListOffset = 616;
 
 #ifdef PLATFORM_WINDOWS
 constexpr int g_iSendNetMessageOffset = 15;
@@ -245,7 +247,11 @@ CUtlVector<CServerSideClient *> *GetClientList()
 	if (!g_pNetworkServerService)
 		return nullptr;
 
-	return (CUtlVector<CServerSideClient *> *)((char *)g_pNetworkServerService->GetIGameServer() + g_iClientListOffset);
+	INetworkGameServer *pServer = g_pNetworkServerService->GetIGameServer();
+	if (!pServer)
+		return nullptr;
+
+	return (CUtlVector<CServerSideClient *> *)((char *)pServer + g_iClientListOffset);
 }
 
 static CServerSideClient *FindClientBySteamID(uint64 steamID64)
@@ -1393,18 +1399,22 @@ bool MultiAddonManager::RemoveAddon(const char *pszAddon, bool bRefresh)
 
 CNetMessagePB<CNETMsg_SignonState> *GetAddonSignonStateMessage(const char *pszAddon)
 {
-	if (!gpGlobals)
+	auto *pClients = GetClientList();
+	if (!gpGlobals || !pClients)
 		return nullptr;
 
 	INetworkMessageInternal *pNetMsg = g_pNetworkMessages->FindNetworkMessagePartial("SignonState");
+	if (!pNetMsg)
+		return nullptr;
+
 	CNetMessagePB<CNETMsg_SignonState> *pMsg = pNetMsg->AllocateMessage()->ToPB<CNETMsg_SignonState>();
 	pMsg->set_spawn_count(gpGlobals->serverCount);
 	pMsg->set_signon_state(SIGNONSTATE_CHANGELEVEL);
 	pMsg->set_addons(pszAddon ? pszAddon : "");
-	pMsg->set_num_server_players(GetClientList()->Count());
-	for (int i = 0; i < GetClientList()->Count(); i++)
+	pMsg->set_num_server_players(pClients->Count());
+	for (int i = 0; i < pClients->Count(); i++)
 	{
-		auto client = GetClientList()->Element(i);
+		auto client = pClients->Element(i);
 
 		char const *szNetworkId = g_pEngineServer->GetPlayerNetworkIDString(client->GetPlayerSlot());
 
@@ -1446,7 +1456,11 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 	
 	if (bRefresh)
 	{
-		CUtlVector<CServerSideClient*> &clients = *GetClientList();
+		auto *pClientList = GetClientList();
+		if (!pClientList)
+			return;
+
+		CUtlVector<CServerSideClient*> &clients = *pClientList;
 		auto pMsg = GetAddonSignonStateMessage(pszAddon);
 		if (!pMsg)
 		{
@@ -1456,6 +1470,8 @@ void MultiAddonManager::AddClientAddon(const char *pszAddon, uint64 steamID64, b
 		FOR_EACH_VEC(clients, i)
 		{
 			CServerSideClient *pClient = clients[i];
+			if (!pClient)
+				continue;
 			uint64 clientSteamId = pClient->GetClientSteamID().ConvertToUint64();
 
 			if (steamID64 != 0 && clientSteamId != steamID64)
@@ -1874,10 +1890,14 @@ KHook::Return<void> MultiAddonManager::Hook_GameFrame(ISource2Server*, bool simu
 		return { KHook::Action::Ignore };
 
 	auto pClients = GetClientList();
+	if (!pClients)
+		return { KHook::Action::Ignore };
 
 	FOR_EACH_VEC(*pClients, i)
 	{
 		auto pClient = (*pClients)[i];
+		if (!pClient)
+			continue;
 
 		uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
 
@@ -1925,6 +1945,9 @@ KHook::Return<int> MultiAddonManager::Hook_LoadEventsFromFile(IGameEventManager2
 
 void FASTCALL Hook_ReplyConnection(INetworkGameServer *server, CServerSideClient *client)
 {
+	if (!server || !client)
+		return;
+
 	uint64 steamID64 = client->GetClientSteamID().ConvertToUint64();
 	// Clear cache if necessary.
 	ClientAddonInfo_t &clientInfo = g_ClientAddons[steamID64];
