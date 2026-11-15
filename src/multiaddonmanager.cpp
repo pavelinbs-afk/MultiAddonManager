@@ -192,17 +192,38 @@ constexpr const byte g_ScriptGetAddon_Sig[] = "\x55\x48\x89\xE5\x41\x55\x41\x54\
 #endif
 
 
-// Offsets (cf61a1c / 23-09-2026). Writing the old 344/584 values after that update
-// corrupts CNetworkGameServer and crashes in ReplyConnection / client list walks.
-// Upstream later dropped these for s2sdk m_szAddonName / m_Clients; keep last known values.
+// Offsets verified via offsetof(CNetworkGameServerBase, ...) against alliedmodders/s2sdk cs2
+// (same values as upstream cf61a1c before they switched to typed m_szAddonName / m_Clients).
 constexpr int g_iServerAddonsOffset = 376;
 constexpr int g_iClientListOffset = 616;
 
+// Last hardcoded indices from official MultiAddonManager (cf61a1c) before s2sdk/KHook.
+// Do not "recount" from incomplete local headers — wrong slot hooks a random virtual and crashes.
 #ifdef PLATFORM_WINDOWS
 constexpr int g_iSendNetMessageOffset = 15;
 #else
 constexpr int g_iSendNetMessageOffset = 16;
 #endif
+
+// Post-11/11 CS2: CNetMessage::GetNetMessage() / PostEventAbstract now yield NetMessageInfo_t*
+// (s2sdk layout), NOT INetworkMessageInternal*. Calling GetNetMessageInfo() on that pointer crashes.
+// Matches upstream MultiAddonManager 033de6c ("Update NetMessage usage").
+struct NetMessageInfo_CS2
+{
+	CUtlString m_szName;
+	void *m_pfnAllocateMessage;
+	CUtlString m_szGroup;
+	NetworkMessageId m_MessageId;
+};
+
+static NetworkMessageId MamGetMessageId(const CNetMessage *pData)
+{
+	if (!pData)
+		return static_cast<NetworkMessageId>(-1);
+
+	auto *info = reinterpret_cast<const NetMessageInfo_CS2 *>(pData->GetNetMessage());
+	return info ? info->m_MessageId : static_cast<NetworkMessageId>(-1);
+}
 
 /* 
 The general workflow is defined as follows:
@@ -322,9 +343,11 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 		Panic("%s", error);
 		return false;
 	}
-	else if (sig_error == SIG_FOUND_MULTIPLE)
+	if (sig_error == SIG_FOUND_MULTIPLE)
 	{
-		Panic("Signature for HostStateRequest occurs multiple times! Using first match but this might end up crashing!\n");
+		V_snprintf(error, maxlen, "HostStateRequest signature matches multiple times; refusing to hook\n");
+		Panic("%s", error);
+		return false;
 	}
 
 	g_pSetPendingHostStateRequest = funchook_create();
@@ -333,14 +356,26 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 
 	// We're using funchook even though it's a virtual function because it can be called on a different thread and KHook isn't thread-safe
 	void **pServerSideClientVTable = (void **)engineModule.FindVirtualTable("CServerSideClient");
+	void **pHLTVClientVTable = (void **)engineModule.FindVirtualTable("CHLTVClient");
+	if (!pServerSideClientVTable || !pHLTVClientVTable)
+	{
+		V_snprintf(error, maxlen, "Could not find CServerSideClient/CHLTVClient vtable\n");
+		Panic("%s", error);
+		return false;
+	}
+
 	g_pfnSendNetMessage_ServerSideClient = (SendNetMessage_t)pServerSideClientVTable[g_iSendNetMessageOffset];
+	g_pfnSendNetMessage_HLTVClient = (SendNetMessage_t)pHLTVClientVTable[g_iSendNetMessageOffset];
+	if (!g_pfnSendNetMessage_ServerSideClient || !g_pfnSendNetMessage_HLTVClient)
+	{
+		V_snprintf(error, maxlen, "SendNetMessage vtable slot %d is null\n", g_iSendNetMessageOffset);
+		Panic("%s", error);
+		return false;
+	}
 
 	g_pSendNetMessageHook_ServerSideClient = funchook_create();
 	funchook_prepare(g_pSendNetMessageHook_ServerSideClient, (void**)&g_pfnSendNetMessage_ServerSideClient, (void*)Hook_SendNetMessage_ServerSideClient);
 	funchook_install(g_pSendNetMessageHook_ServerSideClient, 0);
-
-	void **pHLTVClientVTable = (void **)engineModule.FindVirtualTable("CHLTVClient");
-	g_pfnSendNetMessage_HLTVClient = (SendNetMessage_t)pHLTVClientVTable[g_iSendNetMessageOffset];
 
 	g_pSendNetMessageHook_HLTVClient = funchook_create();
 	funchook_prepare(g_pSendNetMessageHook_HLTVClient, (void **)&g_pfnSendNetMessage_HLTVClient, (void *)Hook_SendNetMessage_HLTVClient);
@@ -354,9 +389,12 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 		Panic("%s", error);
 		return false;
 	}
-	else if (sig_error == SIG_FOUND_MULTIPLE)
+	if (sig_error == SIG_FOUND_MULTIPLE)
 	{
-		Panic("Signature for ReplyConnection occurs multiple times! Using first match but this might end up crashing!\n");
+		// Hooking the wrong lookalike prologue is a hard crash on connect — refuse to load.
+		V_snprintf(error, maxlen, "ReplyConnection signature matches multiple times; refusing to hook\n");
+		Panic("%s", error);
+		return false;
 	}
 
 	g_pReplyConnectionHook = funchook_create();
@@ -371,9 +409,11 @@ bool MultiAddonManager::Load(PluginId id, ISmmAPI *ismm, char *error, size_t max
 		Panic("%s", error);
 		return false;
 	}
-	else if (sig_error == SIG_FOUND_MULTIPLE)
+	if (sig_error == SIG_FOUND_MULTIPLE)
 	{
-		Panic("Signature for ScriptGetAddon occurs multiple times! Using first match but this might end up crashing!\n");
+		V_snprintf(error, maxlen, "ScriptGetAddon signature matches multiple times; refusing to hook\n");
+		Panic("%s", error);
+		return false;
 	}
 
 	g_pScriptGetAddonHook = funchook_create();
@@ -1661,15 +1701,17 @@ KHook::Return<void> MultiAddonManager::Hook_StartupServer(INetworkServerService*
 
 bool FASTCALL Hook_SendNetMessage(CServerSideClientBase *pClient, CNetMessage *pData, NetChannelBufType_t bufType, SendNetMessage_t pOriginalFunc)
 {
-	NetMessageInfo_t *info = pData->GetNetMessage()->GetNetMessageInfo();
-	
+	if (!pClient || !pData || !pOriginalFunc)
+		return false;
+
 	uint64 steamID64 = pClient->GetClientSteamID().ConvertToUint64();
 	ClientAddonInfo_t &clientInfo = g_ClientAddons[steamID64];
 	
 	// If we are sending a message to the client, that means the client is still active.
 	clientInfo.lastActiveTime = Plat_FloatTime();
 
-	if (info->m_MessageId != net_SignonState || !g_pEngineServer->IsDedicatedServer())
+	// Upstream 033de6c: use message id from new NetMessageInfo layout (not GetNetMessageInfo()).
+	if (MamGetMessageId(pData) != net_SignonState || !g_pEngineServer->IsDedicatedServer())
 		return pOriginalFunc(pClient, pData, bufType);
 
 	auto pMsg = pData->ToPB<CNETMsg_SignonState>();
@@ -1913,23 +1955,26 @@ KHook::Return<void> MultiAddonManager::Hook_GameFrame(ISource2Server*, bool simu
 KHook::Return<void> MultiAddonManager::Hook_PostEvent(IGameEventSystem*, CSplitScreenSlot nSlot, bool bLocalOnly, int nClientCount, const uint64 *clients,
 	INetworkMessageInternal *pEvent, const CNetMessage *pData, unsigned long nSize, NetChannelBufType_t bufType)
 {
-	NetMessageInfo_t *info = pEvent->GetNetMessageInfo();
+	if (!mm_block_disconnect_messages.Get() || !pEvent || !pData || !clients || !g_pGameEventManager)
+		return { KHook::Action::Ignore };
 
-	if (mm_block_disconnect_messages.Get() && info->m_MessageId == GE_Source1LegacyGameEvent)
+	// After 11/11 CS2 update this arg is NetMessageInfo_t* (s2sdk), not INetworkMessageInternal*.
+	auto *info = reinterpret_cast<const NetMessageInfo_CS2 *>(pEvent);
+	if (info->m_MessageId != GE_Source1LegacyGameEvent)
+		return { KHook::Action::Ignore };
+
+	auto pMsg = pData->ToPB<CMsgSource1LegacyGameEvent>();
+
+	static int sDisconnectId = g_pGameEventManager->LookupEventId("player_disconnect");
+
+	if (pMsg->eventid() == sDisconnectId)
 	{
-		auto pMsg = pData->ToPB<CMsgSource1LegacyGameEvent>();
+		IGameEvent *pGameEvent = g_pGameEventManager->UnserializeEvent(*pMsg);
 
-		static int sDisconnectId = g_pGameEventManager->LookupEventId("player_disconnect");
-
-		if (pMsg->eventid() == sDisconnectId)
-		{
-			IGameEvent *pEvent = g_pGameEventManager->UnserializeEvent(*pMsg);
-
-			// This will prevent "loop shutdown" messages in the chat when clients reconnect
-			// As far as we're aware, there are no other cases where this reason is used
-			if (pEvent->GetInt("reason") == NETWORK_DISCONNECT_LOOPSHUTDOWN)
-				*(uint64*)clients = 0;
-		}
+		// This will prevent "loop shutdown" messages in the chat when clients reconnect
+		// As far as we're aware, there are no other cases where this reason is used
+		if (pGameEvent && pGameEvent->GetInt("reason") == NETWORK_DISCONNECT_LOOPSHUTDOWN)
+			*(uint64*)clients = 0;
 	}
 
 	return { KHook::Action::Ignore };
@@ -1970,8 +2015,7 @@ void FASTCALL Hook_ReplyConnection(INetworkGameServer *server, CServerSideClient
 	g_MultiAddonManager.GetClientAddons(clientAddons, steamID64);
 	if (clientAddons.Count() == 0)
 	{
-		// No addons to send. This means the list of original addons is empty as well.
-		assert(originalAddons.IsEmpty());
+		// No addons to send — pass through unchanged.
 		clientInfo.currentPendingAddon.clear();
 		g_pfnReplyConnection(server, client);
 		return;

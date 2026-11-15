@@ -103,7 +103,7 @@ public:
 	const char *GetDescription() override	{ return "Multi Addon Manager"; }
 	const char *GetURL() override			{ return "https://github.com/Source2ZE/MultiAddonManager"; }
 	const char *GetLicense() override		{ return "GPL v3 License"; }
-	const char *GetVersion() override		{ return "1.2.4.1"; }
+	const char *GetVersion() override		{ return "1.2.4.2"; }
 	const char *GetDate() override			{ return __DATE__; }
 	const char *GetLogTag() override		{ return "MultiAddonManager"; }
 
